@@ -1,0 +1,477 @@
+"""
+STGformer model implementation.
+
+Based on the paper: "STGformer: Efficient Spatiotemporal Graph Transformer 
+for Traffic Forecasting" by Hongjun Wang et al.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional, Union, Any
+
+from waze_traffic_forecast.models.layers import (
+    GraphPropagation,
+    SpatiotemporalAttention,
+    TemporalPositionalEncoding
+)
+
+
+class STGformerLayer(nn.Module):
+    """
+    Single layer of STGformer combining graph propagation and spatiotemporal attention.
+    """
+    
+    def __init__(self, hidden_dim, **kwargs):
+        """
+        Initialize a STGformer layer.
+        
+        Args:
+            hidden_dim: Hidden dimension size
+            **kwargs: Additional keyword arguments
+        """
+        super(STGformerLayer, self).__init__()
+        
+        # Extract parameters from kwargs with defaults
+        num_heads = kwargs.get('num_heads', 8)
+        dropout = kwargs.get('dropout', 0.1)
+        propagation_steps = kwargs.get('propagation_steps', 3)
+        use_layer_norm = kwargs.get('use_layer_norm', True)
+        use_residual = kwargs.get('use_residual', True)
+        
+        # Graph propagation module
+        self.graph_prop = GraphPropagation(
+            hidden_dim, 
+            hidden_dim, 
+            K=propagation_steps, 
+            activation=F.relu
+        )
+        
+        # Spatiotemporal attention module
+        self.st_attention = SpatiotemporalAttention(
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_layer_norm=use_layer_norm,
+            use_residual=use_residual
+        )
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # Layer normalization
+        self.use_layer_norm = use_layer_norm
+        if use_layer_norm:
+            self.norm1 = nn.LayerNorm(hidden_dim)
+            self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        # Residual connection flag
+        self.use_residual = use_residual
+        
+    def forward(self, x, adj):
+        """
+        Forward pass through the STGformer layer.
+        
+        Args:
+            x: Input tensor [batch_size, seq_len, num_nodes, hidden_dim]
+            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
+            
+        Returns:
+            Output tensor of the same shape as input
+        """
+        batch_size, seq_len, num_nodes, hidden_dim = x.size()
+        residual = x
+        
+        # Apply graph propagation separately for each time step
+        prop_out = []
+        for t in range(seq_len):
+            t_out = self.graph_prop(x[:, t], adj)  # [batch_size, num_nodes, hidden_dim]
+            prop_out.append(t_out)
+        
+        # Stack back into sequence
+        prop_out = torch.stack(prop_out, dim=1)  # [batch_size, seq_len, num_nodes, hidden_dim]
+        
+        # Apply residual connection after graph propagation if specified
+        if self.use_residual:
+            prop_out = prop_out + residual
+            
+        # Apply spatiotemporal attention
+        attn_out = self.st_attention(prop_out)
+        
+        # Apply feed-forward network with layer norm if specified
+        if self.use_layer_norm:
+            ffn_out = self.norm1(attn_out)
+            ffn_out = self.ffn(ffn_out)
+            if self.use_residual:
+                ffn_out = ffn_out + attn_out
+            out = self.norm2(ffn_out)
+        else:
+            ffn_out = self.ffn(attn_out)
+            if self.use_residual:
+                ffn_out = ffn_out + attn_out
+            out = ffn_out
+        
+        return out
+
+
+class STGformer(nn.Module):
+    """
+    STGformer: Efficient Spatiotemporal Graph Transformer for Traffic Forecasting.
+    """
+    
+    def __init__(self, in_channels, out_channels, num_nodes, **kwargs):
+        """
+        Initialize the STGformer model.
+        
+        Args:
+            in_channels: Number of input features
+            out_channels: Number of output features
+            num_nodes: Number of nodes in the graph
+            **kwargs: Additional keyword arguments
+        """
+        super(STGformer, self).__init__()
+        
+        # Extract parameters from kwargs with defaults
+        hidden_dim = kwargs.get('hidden_channels', 64)
+        num_layers = kwargs.get('num_layers', 3)
+        num_heads = kwargs.get('num_heads', 8)
+        dropout = kwargs.get('dropout', 0.1)
+        propagation_steps = kwargs.get('propagation_steps', 3)
+        use_layer_norm = kwargs.get('use_layer_norm', True)
+        use_residual = kwargs.get('use_residual', True)
+        self.seq_length = kwargs.get('sequence_length', 12)
+        self.pred_horizon = kwargs.get('prediction_horizon', 3)
+        
+        # Input embedding
+        self.input_embed = nn.Linear(in_channels, hidden_dim)
+        
+        # Temporal positional encoding
+        self.temporal_pe = TemporalPositionalEncoding(hidden_dim)
+        
+        # STGformer layers
+        self.layers = nn.ModuleList([
+            STGformerLayer(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                propagation_steps=propagation_steps,
+                use_layer_norm=use_layer_norm,
+                use_residual=use_residual
+            ) for _ in range(num_layers)
+        ])
+        
+        # Time-wise fully connected layers (prediction for each future time step)
+        self.output_layer = nn.ModuleList([
+            nn.Linear(hidden_dim, out_channels) for _ in range(self.pred_horizon)
+        ])
+        
+    def forward(self, x_seq, adj):
+        """
+        Forward pass through the STGformer.
+        
+        Args:
+            x_seq: Input sequence [batch_size, seq_len, num_nodes, in_channels]
+            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
+            
+        Returns:
+            Predictions for future time steps [batch_size, pred_horizon, num_nodes, out_channels]
+        """
+        # Embed input features
+        h = self.input_embed(x_seq)  # [batch_size, seq_len, num_nodes, hidden_dim]
+        
+        # Add temporal positional encoding
+        h = self.temporal_pe(h)
+        
+        # Pass through STGformer layers
+        for layer in self.layers:
+            h = layer(h, adj)
+        
+        # Extract the last time step for prediction
+        h_last = h[:, -1]  # [batch_size, num_nodes, hidden_dim]
+        
+        # Predict for each future time step
+        predictions = []
+        for t in range(self.pred_horizon):
+            pred_t = self.output_layer[t](h_last)  # [batch_size, num_nodes, out_channels]
+            predictions.append(pred_t)
+        
+        # Stack predictions along a new dimension
+        out = torch.stack(predictions, dim=1)  # [batch_size, pred_horizon, num_nodes, out_channels]
+        
+        return out
+    
+    def get_loss(self, pred, target, mask=None):
+        """
+        Calculate loss between predictions and targets.
+        
+        Args:
+            pred: Predictions from the model [batch_size, pred_horizon, num_nodes, out_channels]
+            target: Ground truth values [batch_size, pred_horizon, num_nodes, out_channels]
+            mask: Optional mask tensor for valid values
+            
+        Returns:
+            Loss value
+        """
+        if mask is not None:
+            mask = mask.unsqueeze(-1)  # Add feature dimension
+            # Apply mask
+            pred = pred * mask
+            target = target * mask
+            loss = F.mse_loss(pred, target, reduction='sum')
+            # Normalize by the number of valid elements
+            num_valid = mask.sum()
+            loss = loss / (num_valid + 1e-6)
+        else:
+            loss = F.mse_loss(pred, target)
+        
+        return loss
+
+
+class STGformerModel:
+    """
+    High-level wrapper for the STGformer model with training and inference methods.
+    """
+    
+    def __init__(self, config):
+        """
+        Initialize the STGformer model with configuration.
+        
+        Args:
+            config: Configuration dictionary
+        """
+        self.config = config
+        self.model = None
+        self.optimizer = None
+        self.scheduler = None
+        self.device = config['training']['device']
+        
+    def build_model(self, in_channels, out_channels, num_nodes):
+        """
+        Build the STGformer model.
+        
+        Args:
+            in_channels: Number of input features
+            out_channels: Number of output features
+            num_nodes: Number of nodes in the graph
+            
+        Returns:
+            Built model
+        """
+        model_config = self.config['model']
+        data_config = self.config['data']
+        
+        # Create model with parameters from config
+        self.model = STGformer(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_nodes=num_nodes,
+            hidden_channels=model_config['hidden_channels'],
+            num_layers=model_config['num_layers'],
+            num_heads=model_config['num_heads'],
+            dropout=model_config['dropout'],
+            use_layer_norm=model_config['use_layer_norm'],
+            use_residual=model_config['use_residual'],
+            sequence_length=data_config['sequence_length'],
+            prediction_horizon=data_config['prediction_horizon']
+        )
+        
+        # Move model to device
+        self.model = self.model.to(self.device)
+        
+        # Setup optimizer
+        training_config = self.config['training']
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=training_config['learning_rate'],
+            weight_decay=training_config['weight_decay']
+        )
+        
+        # Setup learning rate scheduler
+        if training_config['lr_scheduler'] == 'step':
+            self.scheduler = torch.optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=training_config['lr_scheduler_params']['step_size'],
+                gamma=training_config['lr_scheduler_params']['gamma']
+            )
+        elif training_config['lr_scheduler'] == 'cosine':
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=training_config['num_epochs']
+            )
+        elif training_config['lr_scheduler'] == 'plateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=training_config['lr_scheduler_params']['factor'],
+                patience=training_config['lr_scheduler_params']['patience'],
+                verbose=True
+            )
+        
+        return self.model
+    
+    def train_step(self, x_seq, adj, y_true, mask=None):
+        """
+        Perform one training step.
+        
+        Args:
+            x_seq: Input sequence [batch_size, seq_len, num_nodes, in_channels]
+            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
+            y_true: Ground truth values [batch_size, pred_horizon, num_nodes, out_channels]
+            mask: Optional mask tensor for valid values
+            
+        Returns:
+            Loss value
+        """
+        self.model.train()
+        self.optimizer.zero_grad()
+        
+        # Move data to device
+        x_seq = x_seq.to(self.device)
+        adj = adj.to(self.device)
+        y_true = y_true.to(self.device)
+        if mask is not None:
+            mask = mask.to(self.device)
+        
+        # Forward pass
+        y_pred = self.model(x_seq, adj)
+        
+        # Calculate loss
+        loss = self.model.get_loss(y_pred, y_true, mask)
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping
+        if self.config['training']['grad_clip_value'] > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config['training']['grad_clip_value']
+            )
+        
+        # Update weights
+        self.optimizer.step()
+        
+        return loss.item()
+    
+    def evaluate(self, dataloader, return_predictions=False):
+        """
+        Evaluate the model on a dataset.
+        
+        Args:
+            dataloader: DataLoader with evaluation data
+            return_predictions: Whether to return predictions
+            
+        Returns:
+            Dictionary with evaluation metrics
+        """
+        self.model.eval()
+        total_loss = 0
+        total_samples = 0
+        all_predictions = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                x_seq = batch['x_seq'].to(self.device)
+                adj = batch['a_seq'][-1].to(self.device)  # Use the last adjacency matrix
+                y_true = batch['y_seq'].to(self.device)
+                mask = batch.get('mask')
+                if mask is not None:
+                    mask = mask.to(self.device)
+                
+                # Forward pass
+                y_pred = self.model(x_seq, adj)
+                
+                # Calculate loss
+                loss = self.model.get_loss(y_pred, y_true, mask)
+                
+                batch_size = x_seq.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+                
+                if return_predictions:
+                    all_predictions.append(y_pred.detach().cpu())
+                    all_targets.append(y_true.detach().cpu())
+        
+        avg_loss = total_loss / max(1, total_samples)
+        
+        result = {'loss': avg_loss}
+        
+        if return_predictions:
+            result['predictions'] = torch.cat(all_predictions, dim=0)
+            result['targets'] = torch.cat(all_targets, dim=0)
+        
+        return result
+    
+    def predict(self, x_seq, adj):
+        """
+        Make predictions with the model.
+        
+        Args:
+            x_seq: Input sequence [batch_size, seq_len, num_nodes, in_channels]
+            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
+            
+        Returns:
+            Predictions for future time steps
+        """
+        self.model.eval()
+        with torch.no_grad():
+            x_seq = x_seq.to(self.device)
+            adj = adj.to(self.device)
+            predictions = self.model(x_seq, adj)
+        
+        return predictions.cpu()
+    
+    def save_checkpoint(self, path, epoch=None, **kwargs):
+        """
+        Save model checkpoint.
+        
+        Args:
+            path: Path to save the checkpoint
+            epoch: Current epoch
+            **kwargs: Additional information to save
+        """
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': self.config,
+            'epoch': epoch,
+            **kwargs
+        }
+        
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
+        torch.save(checkpoint, path)
+    
+    def load_checkpoint(self, path, **kwargs):
+        """
+        Load model checkpoint.
+        
+        Args:
+            path: Path to the checkpoint
+            **kwargs: Additional keyword arguments
+        
+        Returns:
+            Loaded checkpoint dictionary
+        """
+        checkpoint = torch.load(path, map_location=self.device)
+        
+        # Load model weights
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load optimizer state if exists and not specified otherwise
+        if not kwargs.get('skip_optimizer', False) and 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load scheduler state if exists and not specified otherwise
+        if not kwargs.get('skip_scheduler', False) and 'scheduler_state_dict' in checkpoint and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        return checkpoint
