@@ -25,6 +25,52 @@ from waze_traffic_forecast.dataset import WazeGraphDataset
 from waze_traffic_forecast.models.stgformer import STGformerModel
 
 
+def sparse_tensor_collate_fn(batch):
+    """
+    Custom collate function that handles both sparse tensors and edge indices.
+    
+    Args:
+        batch: List of samples from the dataset
+        
+    Returns:
+        Batched data with sparse tensors properly handled
+    """
+    elem = batch[0]
+    
+    if isinstance(elem, dict):
+        result = {}
+        for key in elem:
+            if key == 'a_seq':
+                if isinstance(elem[key], list):
+                    if len(elem[key]) > 0 and isinstance(elem[key][0], torch.Tensor):
+                        if hasattr(elem[key][0], 'is_sparse') and elem[key][0].is_sparse:
+                            result[key] = [sample[key] for sample in batch]
+                        elif elem[key][0].dim() == 2 and elem[key][0].shape[0] == 2:
+                            result[key] = [sample[key] for sample in batch]
+                        else:
+                            try:
+                                result[key] = torch.utils.data.default_collate([sample[key] for sample in batch])
+                            except:
+                                result[key] = [sample[key] for sample in batch]
+                    else:
+                        result[key] = [sample[key] for sample in batch]
+                else:
+                    try:
+                        result[key] = torch.utils.data.default_collate([sample[key] for sample in batch])
+                    except:
+                        result[key] = [sample[key] for sample in batch]
+            elif key in ['sampled_nodes', 'global_indices']:
+                result[key] = [sample[key] for sample in batch]
+            else:
+                try:
+                    result[key] = torch.utils.data.default_collate([sample[key] for sample in batch])
+                except RuntimeError:
+                    result[key] = [sample[key] for sample in batch]
+        return result
+    
+    return torch.utils.data.default_collate(batch)
+
+
 def train_model(config, **kwargs):
     """
     Train the STGformer model using the specified configuration.
@@ -81,11 +127,13 @@ def train_model(config, **kwargs):
     seed = kwargs.get('seed', 42)
     set_seed(seed)
     
-    if accelerator.is_main_process:
-        print(f"Loading dataset from {data_dir}")
-    
+    print(f"Loading dataset from {data_dir}")
     dataset = WazeGraphDataset(
         data_dir=data_dir,
+        full_graph=config['data'].get('full_graph', False),
+        subgraph_nodes=config['data'].get('subgraph_nodes', 5000),
+        batch_size=config['data'].get('batch_size', 1000),
+        num_hops=config['data'].get('num_hops', 2),
         sample_size=config['data'].get('sample_size'),
         interval_minutes=config['data']['interval_minutes'],
         max_snapshots=config['data']['max_snapshots'],
@@ -93,16 +141,31 @@ def train_model(config, **kwargs):
         prediction_horizon=config['data']['prediction_horizon'],
         sequence_length=config['data']['sequence_length']
     )
-    
+
+    if config['data'].get('full_graph', False):
+        dataset.init_epoch(0)
+
     if accelerator.is_main_process:
         print(f"Dataset size: {len(dataset)}")
         if dataset.X is not None:
             print(f"Feature tensor shape: {dataset.X.shape}")
-            print(f"Adjacency tensor shape: {dataset.A.shape}")
+            
+            if isinstance(dataset.A, list):
+                print(f"Adjacency format: List of {len(dataset.A)} sparse matrices")
+                if len(dataset.A) > 0:
+                    if hasattr(dataset.A[0], 'size'):
+                        sparse_shape = dataset.A[0].size()
+                        print(f"Each sparse matrix shape: {sparse_shape}")
+            else:
+                print(f"Adjacency tensor shape: {dataset.A.shape}")
+            
+            if config['data'].get('full_graph', False) and dataset.edge_index is not None:
+                print(f"Edge index shape: {dataset.edge_index.shape}")
+                print(f"Total number of edges: {dataset.edge_index.shape[1]}")
             
             in_channels = dataset.X.shape[-1]
-            out_channels = in_channels 
-            num_nodes = dataset.X.shape[1]
+            out_channels = in_channels  
+            num_nodes = dataset.X.shape[1] 
             
             print(f"Number of input features: {in_channels}")
             print(f"Number of output features: {out_channels}")
@@ -113,7 +176,7 @@ def train_model(config, **kwargs):
     else:
         in_channels = dataset.X.shape[-1]
         out_channels = in_channels
-        num_nodes = dataset.X.shape[2]
+        num_nodes = dataset.X.shape[1]
     
     train_size = int(len(dataset) * config['data']['train_ratio'])
     val_size = int(len(dataset) * config['data']['val_ratio'])
@@ -134,7 +197,8 @@ def train_model(config, **kwargs):
         batch_size=config['training']['batch_size'],
         shuffle=True,
         num_workers=kwargs.get('num_workers', 4),
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=sparse_tensor_collate_fn
     )
     
     val_loader = DataLoader(
@@ -142,7 +206,8 @@ def train_model(config, **kwargs):
         batch_size=config['training']['batch_size'],
         shuffle=False,
         num_workers=kwargs.get('num_workers', 4),
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=sparse_tensor_collate_fn
     )
     
     test_loader = DataLoader(
@@ -150,7 +215,8 @@ def train_model(config, **kwargs):
         batch_size=config['training']['batch_size'],
         shuffle=False,
         num_workers=kwargs.get('num_workers', 4),
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=sparse_tensor_collate_fn
     )
     
     if accelerator.is_main_process:
@@ -186,6 +252,9 @@ def train_model(config, **kwargs):
         if accelerator.is_main_process:
             print(f"\nEpoch {epoch+1}/{num_epochs}")
         
+        if config['data'].get('full_graph', False):
+            dataset.init_epoch(epoch)
+        
         model.model.train()
         train_losses = []
         
@@ -197,29 +266,13 @@ def train_model(config, **kwargs):
         
         for batch_idx, batch in enumerate(progress_bar):
             x_seq = batch['x_seq']
-            a_seq = batch['a_seq'][-1] 
+            a_seq = batch['a_seq']
             y_true = batch['y_seq']
             
-            model.optimizer.zero_grad()
+            loss = model.train_step(x_seq, a_seq, y_true)
+            train_losses.append(loss)
             
-            y_pred = model.model(x_seq, a_seq)
-            
-            loss = model.model.get_loss(y_pred, y_true)
-            
-            accelerator.backward(loss)
-            
-            if config['training']['grad_clip_value'] > 0:
-                accelerator.clip_grad_norm_(
-                    model.model.parameters(),
-                    config['training']['grad_clip_value']
-                )
-            
-            model.optimizer.step()
-            
-            gathered_loss = accelerator.gather(torch.tensor(loss.item(), device=accelerator.device)).mean().item()
-            train_losses.append(gathered_loss)
-            
-            progress_bar.set_postfix(loss=gathered_loss)
+            progress_bar.set_postfix(loss=loss)
         
         avg_train_loss = sum(train_losses) / len(train_losses)
         
@@ -237,7 +290,7 @@ def train_model(config, **kwargs):
         with torch.no_grad():
             for batch in progress_bar:
                 x_seq = batch['x_seq']
-                a_seq = batch['a_seq'][-1] 
+                a_seq = batch['a_seq']
                 y_true = batch['y_seq']
                 
                 y_pred = model.model(x_seq, a_seq)
@@ -263,12 +316,14 @@ def train_model(config, **kwargs):
         if accelerator.is_main_process:
             print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
         
+        # Update learning rate scheduler
         if model.scheduler is not None:
             if isinstance(model.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 model.scheduler.step(val_loss)
             else:
                 model.scheduler.step()
         
+        # Early stopping
         if accelerator.is_main_process and val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -288,15 +343,24 @@ def train_model(config, **kwargs):
             )
             print(f"Saved best model checkpoint to {best_model_path}")
         else:
-            patience_counter_tensor = torch.tensor(
-                [patience_counter + 1 if val_loss >= best_val_loss else 0], 
-                device=accelerator.device
-            )
-            accelerator.wait_for_everyone()
-            patience_counter = accelerator.broadcast(patience_counter_tensor)[0].item()
+            if accelerator.is_main_process:
+                patience_counter += 1
+                if val_loss >= best_val_loss:
+                    print(f"Validation loss did not improve. Patience: {patience_counter}/{patience}")
+        
+        # Synchronize patience counter across processes using gather
+        if accelerator.num_processes > 1:
+            # Create patience counter tensor on the correct device
+            patience_tensor = torch.tensor([patience_counter], device=accelerator.device)
             
-            if accelerator.is_main_process and val_loss >= best_val_loss:
-                print(f"Validation loss did not improve. Patience: {patience_counter}/{patience}")
+            # Gather from all processes
+            gathered_patience = accelerator.gather(patience_tensor)
+            
+            # Use the maximum value (if any process needs to stop, all should stop)
+            patience_counter = gathered_patience.max().item()
+        
+        # Wait for all processes to reach this point
+        accelerator.wait_for_everyone()
         
         if accelerator.is_main_process and (epoch + 1) % kwargs.get('save_every', 5) == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pt')
@@ -313,13 +377,16 @@ def train_model(config, **kwargs):
                 checkpoint_path
             )
         
+        # Early stopping
         if patience_counter >= patience:
             if accelerator.is_main_process:
                 print(f"Early stopping triggered after {epoch+1} epochs")
             break
     
+    # Wait for all processes to reach this point
     accelerator.wait_for_everyone()
     
+    # Load best model for final evaluation (on main process only)
     best_model_path = os.path.join(checkpoint_dir, 'best_model.pt')
     if accelerator.is_main_process and os.path.exists(best_model_path):
         print(f"Loading best model from {best_model_path}")
@@ -344,7 +411,7 @@ def train_model(config, **kwargs):
     with torch.no_grad():
         for batch in progress_bar:
             x_seq = batch['x_seq']
-            a_seq = batch['a_seq'][-1]
+            a_seq = batch['a_seq']
             y_true = batch['y_seq']
             
             y_pred = model.model(x_seq, a_seq)

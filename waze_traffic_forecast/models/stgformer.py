@@ -16,7 +16,6 @@ from waze_traffic_forecast.models.layers import (
     TemporalPositionalEncoding
 )
 
-
 class STGformerLayer(nn.Module):
     """
     Single layer of STGformer combining graph propagation and spatiotemporal attention.
@@ -74,14 +73,17 @@ class STGformerLayer(nn.Module):
         # Residual connection flag
         self.use_residual = use_residual
         
-    def forward(self, x, adj):
+    def forward(self, x, adj_list):
         """
         Forward pass through the STGformer layer.
         
         Args:
             x: Input tensor [batch_size, seq_len, num_nodes, hidden_dim]
-            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
-            
+            adj_list: Adjacency matrices - can be:
+                - List of sparse matrices for each timestep
+                - List of lists of sparse matrices (one list per batch item)
+                - Dense tensor [batch_size, num_nodes, num_nodes]
+                
         Returns:
             Output tensor of the same shape as input
         """
@@ -90,18 +92,40 @@ class STGformerLayer(nn.Module):
         
         # Apply graph propagation separately for each time step
         prop_out = []
+        
+        sparse_mode = isinstance(adj_list, list)
+        
         for t in range(seq_len):
-            t_out = self.graph_prop(x[:, t], adj)  # [batch_size, num_nodes, hidden_dim]
+            # Get adjacency matrix for this timestep
+            if sparse_mode:
+                # Handle list of sparse matrices or list of lists
+                if isinstance(adj_list[0], list):
+                    # We have a list of lists [batch][time]
+                    # Extract the adjacency matrices for this timestep across all batches
+                    adj_t = []
+                    for batch_item in adj_list:
+                        if t < len(batch_item):
+                            adj_t.append(batch_item[t])
+                        else:
+                            # Use last available timestep if out of bounds
+                            adj_t.append(batch_item[-1])
+                else:
+                    if t < len(adj_list):
+                        adj_t = adj_list[t]
+                    else:
+                        adj_t = adj_list[-1]
+            else:
+                # Dense tensor case
+                adj_t = adj_list
+            
+            t_out = self.graph_prop(x[:, t], adj_t)
             prop_out.append(t_out)
         
-        # Stack back into sequence
-        prop_out = torch.stack(prop_out, dim=1)  # [batch_size, seq_len, num_nodes, hidden_dim]
+        prop_out = torch.stack(prop_out, dim=1)  
         
-        # Apply residual connection after graph propagation if specified
         if self.use_residual:
             prop_out = prop_out + residual
             
-        # Apply spatiotemporal attention
         attn_out = self.st_attention(prop_out)
         
         # Apply feed-forward network with layer norm if specified
@@ -177,32 +201,40 @@ class STGformer(nn.Module):
         
         Args:
             x_seq: Input sequence [batch_size, seq_len, num_nodes, in_channels]
-            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
-            
+            adj: Adjacency matrices - can be:
+                - List of sparse matrices
+                - List of lists of sparse matrices (one list per batch item)
+                - Dense tensor [batch_size, seq_len, num_nodes, num_nodes]
+                
         Returns:
             Predictions for future time steps [batch_size, pred_horizon, num_nodes, out_channels]
         """
-        # Embed input features
-        h = self.input_embed(x_seq)  # [batch_size, seq_len, num_nodes, hidden_dim]
+        h = self.input_embed(x_seq)  
         
-        # Add temporal positional encoding
         h = self.temporal_pe(h)
         
-        # Pass through STGformer layers
+        batch_size = x_seq.size(0)
+        
+        if isinstance(adj, list) and isinstance(adj[0], list):
+            adj_batch = adj
+        
+        elif isinstance(adj, list) and hasattr(adj[0], 'is_sparse') and adj[0].is_sparse:
+            adj_batch = [adj] * batch_size
+        
+        else:
+            adj_batch = adj
+        
         for layer in self.layers:
-            h = layer(h, adj)
+            h = layer(h, adj_batch)
         
-        # Extract the last time step for prediction
-        h_last = h[:, -1]  # [batch_size, num_nodes, hidden_dim]
+        h_last = h[:, -1]
         
-        # Predict for each future time step
         predictions = []
         for t in range(self.pred_horizon):
-            pred_t = self.output_layer[t](h_last)  # [batch_size, num_nodes, out_channels]
+            pred_t = self.output_layer[t](h_last) 
             predictions.append(pred_t)
         
-        # Stack predictions along a new dimension
-        out = torch.stack(predictions, dim=1)  # [batch_size, pred_horizon, num_nodes, out_channels]
+        out = torch.stack(predictions, dim=1)  
         
         return out
     
@@ -219,12 +251,10 @@ class STGformer(nn.Module):
             Loss value
         """
         if mask is not None:
-            mask = mask.unsqueeze(-1)  # Add feature dimension
-            # Apply mask
+            mask = mask.unsqueeze(-1)  
             pred = pred * mask
             target = target * mask
             loss = F.mse_loss(pred, target, reduction='sum')
-            # Normalize by the number of valid elements
             num_valid = mask.sum()
             loss = loss / (num_valid + 1e-6)
         else:
@@ -266,7 +296,6 @@ class STGformerModel:
         model_config = self.config['model']
         data_config = self.config['data']
         
-        # Create model with parameters from config
         self.model = STGformer(
             in_channels=in_channels,
             out_channels=out_channels,
@@ -281,10 +310,8 @@ class STGformerModel:
             prediction_horizon=data_config['prediction_horizon']
         )
         
-        # Move model to device
         self.model = self.model.to(self.device)
         
-        # Setup optimizer
         training_config = self.config['training']
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
@@ -292,7 +319,6 @@ class STGformerModel:
             weight_decay=training_config['weight_decay']
         )
         
-        # Setup learning rate scheduler
         if training_config['lr_scheduler'] == 'step':
             self.scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer,
@@ -321,7 +347,7 @@ class STGformerModel:
         
         Args:
             x_seq: Input sequence [batch_size, seq_len, num_nodes, in_channels]
-            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
+            adj: Adjacency matrices (can be in various formats)
             y_true: Ground truth values [batch_size, pred_horizon, num_nodes, out_channels]
             mask: Optional mask tensor for valid values
             
@@ -331,30 +357,37 @@ class STGformerModel:
         self.model.train()
         self.optimizer.zero_grad()
         
-        # Move data to device
         x_seq = x_seq.to(self.device)
-        adj = adj.to(self.device)
+        
+        if isinstance(adj, list):
+            if isinstance(adj[0], list):
+                adj_device = []
+                for batch_item in adj:
+                    batch_item_device = []
+                    for sparse_mat in batch_item:
+                        batch_item_device.append(sparse_mat.to(self.device))
+                    adj_device.append(batch_item_device)
+            else:
+                adj_device = [sparse_mat.to(self.device) for sparse_mat in adj]
+        else:
+            adj_device = adj.to(self.device)
+        
         y_true = y_true.to(self.device)
         if mask is not None:
             mask = mask.to(self.device)
         
-        # Forward pass
-        y_pred = self.model(x_seq, adj)
+        y_pred = self.model(x_seq, adj_device)
         
-        # Calculate loss
         loss = self.model.get_loss(y_pred, y_true, mask)
         
-        # Backward pass
         loss.backward()
         
-        # Gradient clipping
         if self.config['training']['grad_clip_value'] > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.config['training']['grad_clip_value']
             )
         
-        # Update weights
         self.optimizer.step()
         
         return loss.item()
@@ -379,16 +412,14 @@ class STGformerModel:
         with torch.no_grad():
             for batch in dataloader:
                 x_seq = batch['x_seq'].to(self.device)
-                adj = batch['a_seq'][-1].to(self.device)  # Use the last adjacency matrix
+                adj = batch['a_seq'][-1].to(self.device) 
                 y_true = batch['y_seq'].to(self.device)
                 mask = batch.get('mask')
                 if mask is not None:
                     mask = mask.to(self.device)
                 
-                # Forward pass
                 y_pred = self.model(x_seq, adj)
                 
-                # Calculate loss
                 loss = self.model.get_loss(y_pred, y_true, mask)
                 
                 batch_size = x_seq.size(0)
@@ -463,14 +494,11 @@ class STGformerModel:
         """
         checkpoint = torch.load(path, map_location=self.device)
         
-        # Load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Load optimizer state if exists and not specified otherwise
         if not kwargs.get('skip_optimizer', False) and 'optimizer_state_dict' in checkpoint:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
-        # Load scheduler state if exists and not specified otherwise
         if not kwargs.get('skip_scheduler', False) and 'scheduler_state_dict' in checkpoint and self.scheduler:
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         

@@ -43,51 +43,135 @@ class GraphPropagation(nn.Module):
         
         Args:
             x: Node features tensor [batch_size, num_nodes, in_channels]
-            adj: Adjacency matrix [batch_size, num_nodes, num_nodes]
-            
+            adj: Adjacency matrix - can be:
+                 - Sparse tensor
+                 - List of sparse tensors (one per batch item)
+                 - Dense tensor [batch_size, num_nodes, num_nodes]
+                
         Returns:
             Output tensor [batch_size, num_nodes, out_channels]
         """
         batch_size, num_nodes, _ = x.size()
         
-        # Identity matrix
-        identity = torch.eye(num_nodes, device=x.device)
-        if batch_size > 1:
-            identity = identity.unsqueeze(0).repeat(batch_size, 1, 1)
-        
-        # Normalized Laplacian
-        degree = torch.sum(adj, dim=-1)
-        degree_inv_sqrt = torch.pow(degree + 1e-6, -0.5)
-        degree_inv_sqrt = torch.diag_embed(degree_inv_sqrt)
-        
-        laplacian = identity - torch.bmm(
-            torch.bmm(degree_inv_sqrt, adj),
-            degree_inv_sqrt
-        )
-        
-        # Scaled Laplacian for numerical stability
-        lambda_max = 2.0  # Maximum eigenvalue of normalized Laplacian
-        scaled_laplacian = (2.0 * laplacian / lambda_max) - identity
-        
-        # Chebyshev polynomial approximation
-        Tx_0 = x  # Order 0
-        out = self.weights[0](Tx_0)
-        
-        if self.K >= 1:
-            Tx_1 = torch.bmm(scaled_laplacian, x)  # Order 1
-            out = out + self.weights[1](Tx_1)
+        # Handle different adjacency formats
+        if isinstance(adj, list):
+            # Process each batch item separately with its corresponding adjacency matrix
+            outputs = []
+            for b in range(batch_size):
+                # Get features for this batch item
+                x_b = x[b]  # [num_nodes, in_channels]
+                
+                # Get the correct adjacency matrix for this batch item
+                if b < len(adj):
+                    adj_b = adj[b]
+                else:
+                    # Use the last available if we have fewer adj matrices than batch items
+                    adj_b = adj[-1]
+                
+                # Apply feature transformation first (order 0)
+                out_b = self.weights[0](x_b)  # [num_nodes, out_channels]
+                
+                # For sparse matrix, use special handling
+                if hasattr(adj_b, 'is_sparse') and adj_b.is_sparse:
+                    if self.K >= 1:
+                        # For each feature channel, apply sparse matrix multiplication
+                        propagated_features = []
+                        
+                        # Apply sparse matrix multiplication for first-order approximation
+                        # Instead of reshaping, we'll process each input channel separately
+                        for c in range(self.in_channels):
+                            # Extract this feature channel for all nodes
+                            channel_features = x_b[:, c].unsqueeze(1)  # [num_nodes, 1]
+                            
+                            # Apply sparse matrix multiplication
+                            propagated = torch.sparse.mm(adj_b, channel_features)  # [num_nodes, 1]
+                            propagated_features.append(propagated)
+                        
+                        # Stack all propagated features
+                        propagated_x = torch.cat(propagated_features, dim=1)  # [num_nodes, in_channels]
+                        
+                        # Apply feature transformation for first-order term
+                        out_b = out_b + self.weights[1](propagated_x)
+                        
+                        # Higher-order terms would be too expensive, so we limit to first-order
+                else:
+                    # Dense matrix case - use full Chebyshev polynomial
+                    # Identity matrix
+                    identity = torch.eye(num_nodes, device=x.device)
+                    
+                    # Normalized Laplacian
+                    degree = torch.sum(adj_b, dim=-1)
+                    degree_inv_sqrt = torch.pow(degree + 1e-6, -0.5)
+                    degree_inv_sqrt = torch.diag_embed(degree_inv_sqrt)
+                    
+                    laplacian = identity - torch.matmul(
+                        torch.matmul(degree_inv_sqrt, adj_b),
+                        degree_inv_sqrt
+                    )
+                    
+                    # Scaled Laplacian for numerical stability
+                    lambda_max = 2.0  # Maximum eigenvalue of normalized Laplacian
+                    scaled_laplacian = (2.0 * laplacian / lambda_max) - identity
+                    
+                    # First-order term
+                    if self.K >= 1:
+                        Tx_1 = torch.matmul(scaled_laplacian, x_b)  # [num_nodes, in_channels]
+                        out_b = out_b + self.weights[1](Tx_1)
+                        
+                        # Higher-order terms
+                        Tx_0 = x_b
+                        for k in range(2, self.K + 1):
+                            # Recurrence relation: T_k(x) = 2xT_{k-1}(x) - T_{k-2}(x)
+                            Tx_k = 2 * torch.matmul(scaled_laplacian, Tx_1) - Tx_0
+                            out_b = out_b + self.weights[k](Tx_k)
+                            Tx_0, Tx_1 = Tx_1, Tx_k
+                
+                # Add batch dimension back
+                out_b = out_b.unsqueeze(0)  # [1, num_nodes, out_channels]
+                outputs.append(out_b)
             
-        for k in range(2, self.K + 1):
-            # Recurrence relation: T_k(x) = 2xT_{k-1}(x) - T_{k-2}(x)
-            Tx_k = 2 * torch.bmm(scaled_laplacian, Tx_1) - Tx_0
-            out = out + self.weights[k](Tx_k)
-            Tx_0, Tx_1 = Tx_1, Tx_k
+            # Combine results from all batch items
+            out = torch.cat(outputs, dim=0)
+            
+        else:
+            # Original implementation for dense tensor
+            # Identity matrix
+            identity = torch.eye(num_nodes, device=x.device)
+            if batch_size > 1:
+                identity = identity.unsqueeze(0).repeat(batch_size, 1, 1)
+            
+            # Normalized Laplacian
+            degree = torch.sum(adj, dim=-1)
+            degree_inv_sqrt = torch.pow(degree + 1e-6, -0.5)
+            degree_inv_sqrt = torch.diag_embed(degree_inv_sqrt)
+            
+            laplacian = identity - torch.bmm(
+                torch.bmm(degree_inv_sqrt, adj),
+                degree_inv_sqrt
+            )
+            
+            # Scaled Laplacian for numerical stability
+            lambda_max = 2.0  # Maximum eigenvalue of normalized Laplacian
+            scaled_laplacian = (2.0 * laplacian / lambda_max) - identity
+            
+            # Chebyshev polynomial approximation
+            Tx_0 = x  # Order 0
+            out = self.weights[0](Tx_0)
+            
+            if self.K >= 1:
+                Tx_1 = torch.bmm(scaled_laplacian, x)  # Order 1
+                out = out + self.weights[1](Tx_1)
+                
+                for k in range(2, self.K + 1):
+                    # Recurrence relation: T_k(x) = 2xT_{k-1}(x) - T_{k-2}(x)
+                    Tx_k = 2 * torch.bmm(scaled_laplacian, Tx_1) - Tx_0
+                    out = out + self.weights[k](Tx_k)
+                    Tx_0, Tx_1 = Tx_1, Tx_k
         
         if self.activation is not None:
             out = self.activation(out)
         
         return out
-
 
 class SpatiotemporalAttention(nn.Module):
     """
