@@ -1,0 +1,57 @@
+# Waze Traffic Forecast Configuration
+
+# Data settings
+data:
+  directory: /scratch/mj6ux/data/waze
+  sample_size: null  # Set to a number for development/testing
+  interval_minutes: 15
+  max_snapshots: 1000
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  sequence_length: 12  # Number of historical steps
+  prediction_horizon: 3  # Number of future steps to predict
+  feature_columns:
+    - speed
+    - severity
+    - delay
+    - length
+  # Graph sampling options
+  full_graph: false  # Set to true to train on the full graph using mini-batches
+  subgraph_nodes: 5000  # Maximum nodes for subgraph sampling (used when full_graph is false)
+  batch_size: 1000  # Mini-batch size for full graph training
+  num_hops: 2  # Number of hops for neighborhood sampling
+
+# Model settings
+model:
+  name: STGformer
+  hidden_channels: 64
+  num_layers: 3
+  num_heads: 8
+  dropout: 0.1
+  attention_dropout: 0.1
+  use_layer_norm: true
+  use_residual: true
+  propagation_steps: 2  # Number of graph propagation hops
+
+# Training settings
+training:
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  num_epochs: 100
+  patience: 10  # Early stopping patience
+  lr_scheduler: cosine  # Options: step, cosine, plateau
+  lr_scheduler_params:
+    step_size: 10
+    gamma: 0.1
+    factor: 0.5
+    patience: 5
+  grad_clip_value: 5.0
+  device: auto  # Options: auto, cuda, cpu
+
+# Paths
+paths:
+  output_dir: ./output
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs

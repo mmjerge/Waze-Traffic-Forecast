@@ -1,0 +1,4 @@
+[console_scripts]
+waze-build-graph = scripts.build_waze_graph:main
+waze-inspect = scripts.inspect_waze_schema:main
+waze-train = scripts.train_model:main

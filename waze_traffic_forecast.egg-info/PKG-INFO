@@ -1,0 +1,43 @@
+Metadata-Version: 2.2
+Name: waze_traffic_forecast
+Version: 0.1.0
+Summary: Traffic forecasting with graph transformers using Waze data
+Home-page: https://github.com/username/waze-traffic-forecast
+Author: Michael Jerge
+Author-email: mj6ux@virginia.edu
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.11
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=1.3.0
+Requires-Dist: numpy>=1.20.0
+Requires-Dist: torch>=1.10.0
+Requires-Dist: pyarrow>=6.0.0
+Requires-Dist: matplotlib>=3.4.0
+Requires-Dist: networkx>=2.6.0
+Requires-Dist: scikit-learn>=1.0.0
+Requires-Dist: tqdm>=4.62.0
+Requires-Dist: pytz>=2021.1
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: dev
+Requires-Dist: pytest>=6.2.5; extra == "dev"
+Requires-Dist: black>=21.6b0; extra == "dev"
+Requires-Dist: flake8>=3.9.2; extra == "dev"
+Requires-Dist: isort>=5.9.2; extra == "dev"
+Requires-Dist: jupyter>=1.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=2.12.1; extra == "dev"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+# graph_ml
