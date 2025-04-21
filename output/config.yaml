@@ -33,7 +33,7 @@ paths:
   output_dir: ./output
 training:
   batch_size: 32
-  device: cuda
+  device: cpu
   grad_clip_value: 5.0
   learning_rate: 0.001
   lr_scheduler: cosine

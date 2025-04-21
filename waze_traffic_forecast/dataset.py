@@ -22,13 +22,14 @@ class WazeGraphDataset(Dataset):
         max_snapshots=100,
         feature_cols=None,
         prediction_horizon=1,
-        sequence_length=12
+        sequence_length=12,
+        use_csv=True  # Add parameter to force using CSV files
     ):
         """
         Initialize the Waze graph dataset.
         
         Args:
-            data_dir: Directory containing Waze parquet files
+            data_dir: Directory containing Waze data files
             full_graph: Whether to use full graph training with mini-batches
             subgraph_nodes: Maximum nodes for subgraph when not using full graph
             batch_size: Number of seed nodes per batch for mini-batch training
@@ -39,6 +40,7 @@ class WazeGraphDataset(Dataset):
             feature_cols: List of feature columns to use
             prediction_horizon: Number of future time steps to predict
             sequence_length: Number of historical time steps to use as input
+            use_csv: Whether to use CSV files instead of parquet files
         """
         self.data_dir = data_dir
         self.full_graph = full_graph
@@ -51,6 +53,7 @@ class WazeGraphDataset(Dataset):
         self.feature_cols = feature_cols
         self.prediction_horizon = prediction_horizon
         self.sequence_length = sequence_length
+        self.use_csv = use_csv
         
         # Process data
         self.X, self.A, self.edge_index, self.nodes_df, self.timestamps = self._process_data()
@@ -66,13 +69,34 @@ class WazeGraphDataset(Dataset):
         nodes_df = None
         
         try:
-            # Load the data from parquet files
-            segments_file = os.path.join(self.data_dir, 'waze-jam-segments000.parquet')
-            jams_file = os.path.join(self.data_dir, 'waze-jams000.parquet')
+            # Check for both parquet and CSV files
+            segments_parquet = os.path.join(self.data_dir, 'waze-jam-segments000.parquet')
+            segments_csv = os.path.join(self.data_dir, 'waze-jam-segments000.csv')
+            jams_parquet = os.path.join(self.data_dir, 'waze-jams000.parquet')
+            jams_csv = os.path.join(self.data_dir, 'waze-jams000.csv')
+            
+            # Determine which files to use based on availability and preference
+            use_csv_segments = self.use_csv or (not os.path.exists(segments_parquet) and os.path.exists(segments_csv))
+            use_csv_jams = self.use_csv or (not os.path.exists(jams_parquet) and os.path.exists(jams_csv))
+            
+            segments_file = segments_csv if use_csv_segments else segments_parquet
+            jams_file = jams_csv if use_csv_jams else jams_parquet
             
             if os.path.exists(segments_file) and os.path.exists(jams_file):
-                segments_df = pd.read_parquet(segments_file)
-                jams_df = pd.read_parquet(jams_file)
+                # Load data from appropriate file format
+                if segments_file.endswith('.csv'):
+                    print(f"Reading segments from CSV: {segments_file}")
+                    segments_df = pd.read_csv(segments_file)
+                else:
+                    print(f"Reading segments from parquet: {segments_file}")
+                    segments_df = pd.read_parquet(segments_file)
+                
+                if jams_file.endswith('.csv'):
+                    print(f"Reading jams from CSV: {jams_file}")
+                    jams_df = pd.read_csv(jams_file)
+                else:
+                    print(f"Reading jams from parquet: {jams_file}")
+                    jams_df = pd.read_parquet(jams_file)
                 
                 if self.sample_size:
                     segments_df = segments_df.sample(min(self.sample_size, len(segments_df)))
@@ -123,7 +147,7 @@ class WazeGraphDataset(Dataset):
                 return X, A, edge_index, nodes_df, timestamps
                 
             else:
-                raise FileNotFoundError("Waze data files not found")
+                raise FileNotFoundError(f"Waze data files not found. Looked for {segments_file} and {jams_file}")
                 
         except Exception as e:
             print(f"Error processing data: {str(e)}")
