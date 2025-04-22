@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 import torch
 from datetime import datetime
-import pandas as pd
+from collections import defaultdict
+from tqdm import tqdm  # Import tqdm for progress bars
 
 class WazeGraphBuilder:
     def __init__(self):
@@ -65,8 +66,8 @@ class WazeGraphBuilder:
                     )
                     print(f"Added {len(existing_attrs)-1} traffic attributes to edges")
         
-        # Sample a subgraph if there are too many nodes
-        if len(nodes_df) > max_nodes:
+        # Sample a subgraph if there are too many nodes AND max_nodes is not None
+        if max_nodes is not None and len(nodes_df) > max_nodes:
             print(f"Graph too large ({len(nodes_df)} nodes). Sampling subgraph...")
             nodes_df, edges_df = self.sample_node_subgraph(nodes_df, edges_df, max_nodes=max_nodes)
         
@@ -101,12 +102,12 @@ class WazeGraphBuilder:
         if not isinstance(min_time, (datetime, np.datetime64, pd.Timestamp)):
             # Use integer indices if timestamps aren't datetime
             snapshots = []
-            for i in range(min(max_snapshots or 10, len(sorted_timestamps))):
+            for i in tqdm(range(min(max_snapshots or 10, len(sorted_timestamps))), desc="Creating snapshots"):
                 mask = edges_df['scrapedatetime'] == sorted_timestamps[i]
                 snapshot_edges = edges_df[mask]
                 
                 # Sample edges if there are too many
-                if len(snapshot_edges) > max_edges_per_snapshot:
+                if max_edges_per_snapshot is not None and len(snapshot_edges) > max_edges_per_snapshot:
                     snapshot_edges = self.sample_important_edges(snapshot_edges, max_edges=max_edges_per_snapshot)
                 
                 snapshots.append({
@@ -134,7 +135,7 @@ class WazeGraphBuilder:
         
         # Create graph snapshots for each interval
         snapshots = []
-        for i, t_start in enumerate(intervals[:-1]):
+        for i, t_start in tqdm(enumerate(intervals[:-1]), total=len(intervals)-1, desc="Creating snapshots"):
             t_end = intervals[i+1]
             
             # Filter edges for this time interval
@@ -148,7 +149,7 @@ class WazeGraphBuilder:
             snapshot_edges = edges_df[mask]
             
             # Sample edges if there are too many
-            if len(snapshot_edges) > max_edges_per_snapshot:
+            if max_edges_per_snapshot is not None and len(snapshot_edges) > max_edges_per_snapshot:
                 snapshot_edges = self.sample_important_edges(snapshot_edges, max_edges=max_edges_per_snapshot)
             
             if len(snapshot_edges) > 0:
@@ -174,6 +175,7 @@ class WazeGraphBuilder:
             A: List of sparse adjacency matrices
         """
         if not snapshots:
+            print("No snapshots provided to prepare_tensor_data")
             return None, None
         
         # Default feature columns if not specified
@@ -185,6 +187,7 @@ class WazeGraphBuilder:
                     feature_cols.append(col)
             
             if not feature_cols:
+                print("No feature columns found or specified")
                 return None, None
         
         # Get node mapping
@@ -202,119 +205,108 @@ class WazeGraphBuilder:
         # Use a list of sparse tensors instead of a dense 3D tensor
         sparse_adjacency_list = []
         
-        # Fill tensors from snapshots
-        for t, snapshot in enumerate(snapshots):
-            edges = snapshot['edges']
-            
-            # Skip empty snapshots
-            if len(edges) == 0:
-                # Add empty sparse tensor
+        # Fill tensors from snapshots using tqdm for progress tracking
+        for t, snapshot in tqdm(enumerate(snapshots), total=num_timesteps, desc="Processing snapshots"):
+            try:
+                edges = snapshot['edges']
+                
+                # Skip empty snapshots
+                if len(edges) == 0:
+                    # Add empty sparse tensor
+                    indices = torch.LongTensor([[],[]])
+                    values = torch.FloatTensor([])
+                    # FIX: Use sparse_coo_tensor instead of sparse.FloatTensor
+                    sparse_adjacency = torch.sparse_coo_tensor(
+                        indices, values, (num_nodes, num_nodes)
+                    )
+                    sparse_adjacency_list.append(sparse_adjacency)
+                    continue
+                
+                # Create sparse adjacency for this snapshot
+                source_indices = []
+                target_indices = []
+                edge_values = []
+                
+                for _, edge in edges.iterrows():
+                    source = edge['source']
+                    target = edge['target']
+                    
+                    # Skip if source or target not in node mapping
+                    if source not in node_to_idx or target not in node_to_idx:
+                        continue
+                    
+                    i, j = node_to_idx[source], node_to_idx[target]
+                    source_indices.append(i)
+                    target_indices.append(j)
+                    edge_values.append(1.0)  # Or any weight value
+                    
+                    # Add edge features to nodes
+                    for f, feat in enumerate(feature_cols):
+                        if feat in edge and not pd.isna(edge[feat]):
+                            # Add feature to target node
+                            X[t, j, f] = edge[feat]
+                
+                # Create sparse tensor
+                if source_indices:  # Only if we have edges
+                    indices = torch.LongTensor([source_indices, target_indices])
+                    values = torch.FloatTensor(edge_values)
+                    # FIX: Use sparse_coo_tensor instead of sparse.FloatTensor
+                    sparse_adjacency = torch.sparse_coo_tensor(
+                        indices, values, (num_nodes, num_nodes)
+                    )
+                else:
+                    # Empty sparse tensor
+                    indices = torch.LongTensor([[],[]])
+                    values = torch.FloatTensor([])
+                    # FIX: Use sparse_coo_tensor instead of sparse.FloatTensor
+                    sparse_adjacency = torch.sparse_coo_tensor(
+                        indices, values, (num_nodes, num_nodes)
+                    )
+                
+                sparse_adjacency_list.append(sparse_adjacency)
+            except Exception as e:
+                print(f"Error processing snapshot {t}: {str(e)}")
+                # Create an empty tensor as a fallback
                 indices = torch.LongTensor([[],[]])
                 values = torch.FloatTensor([])
-                sparse_adjacency = torch.sparse.FloatTensor(
+                sparse_adjacency = torch.sparse_coo_tensor(
                     indices, values, (num_nodes, num_nodes)
                 )
                 sparse_adjacency_list.append(sparse_adjacency)
-                continue
-            
-            # Create sparse adjacency for this snapshot
-            source_indices = []
-            target_indices = []
-            edge_values = []
-            
-            for _, edge in edges.iterrows():
-                source = edge['source']
-                target = edge['target']
-                
-                # Skip if source or target not in node mapping
-                if source not in node_to_idx or target not in node_to_idx:
-                    continue
-                
-                i, j = node_to_idx[source], node_to_idx[target]
-                source_indices.append(i)
-                target_indices.append(j)
-                edge_values.append(1.0)  # Or any weight value
-                
-                # Add edge features to nodes
-                for f, feat in enumerate(feature_cols):
-                    if feat in edge and not pd.isna(edge[feat]):
-                        # Add feature to target node
-                        X[t, j, f] = edge[feat]
-            
-            # Create sparse tensor
-            if source_indices:  # Only if we have edges
-                indices = torch.LongTensor([source_indices, target_indices])
-                values = torch.FloatTensor(edge_values)
-                sparse_adjacency = torch.sparse.FloatTensor(
-                    indices, values, (num_nodes, num_nodes)
-                )
-            else:
-                # Empty sparse tensor
-                indices = torch.LongTensor([[],[]])
-                values = torch.FloatTensor([])
-                sparse_adjacency = torch.sparse.FloatTensor(
-                    indices, values, (num_nodes, num_nodes)
-                )
-            
-            sparse_adjacency_list.append(sparse_adjacency)
         
         # Convert features to tensor
         X_tensor = torch.FloatTensor(X)
         
+        print(f"Created feature tensor with shape {X_tensor.shape} and {len(sparse_adjacency_list)} adjacency matrices")
         return X_tensor, sparse_adjacency_list
 
     def sample_important_edges(self, edges_df, max_edges=100000):
         """
         Sample important edges to reduce memory usage.
-        
-        Args:
-            edges_df: DataFrame with edge data
-            max_edges: Maximum number of edges to keep
-            
-        Returns:
-            Sampled edges DataFrame
         """
-        if len(edges_df) <= max_edges:
+        # Check if sampling is needed
+        if max_edges is None or len(edges_df) <= max_edges:
             return edges_df
         
         print(f"Sampling {max_edges} edges from {len(edges_df)} total edges...")
         
-        if 'severity' in edges_df.columns:
-            severity = edges_df['severity'].fillna(0) + 1e-5
-            
-            probs = severity / severity.sum()
-            
-            try:
-                sampled_indices = np.random.choice(
-                    edges_df.index, 
-                    size=max_edges, 
-                    replace=False, 
-                    p=probs
-                )
-                return edges_df.loc[sampled_indices]
-            except ValueError:
-                print("Warning: Could not sample with probability weights. Using random sampling.")
+        try:
+            if 'severity' in edges_df.columns:
+                # Use pandas' built-in weighted sampling - much more efficient
+                return edges_df.sample(max_edges, weights='severity', replace=False)
+            elif 'speed' in edges_df.columns:
+                # For speed, lower speeds should have higher weights
+                # Create a weight column that's inversely proportional to speed
+                with pd.option_context('mode.chained_assignment', None):
+                    temp_df = edges_df.copy()
+                    temp_df['weight'] = 1.0 / temp_df['speed'].clip(lower=0.1)
+                    return temp_df.sample(max_edges, weights='weight', replace=False)
+            else:
+                # No weights available, use random sampling
                 return edges_df.sample(max_edges)
-        
-        elif 'speed' in edges_df.columns:
-            speed = edges_df['speed'].fillna(edges_df['speed'].mean())
-            inverted_speed = 1 / (speed + 1e-5)  
-            
-            probs = inverted_speed / inverted_speed.sum()
-            
-            try:
-                sampled_indices = np.random.choice(
-                    edges_df.index, 
-                    size=max_edges, 
-                    replace=False, 
-                    p=probs
-                )
-                return edges_df.loc[sampled_indices]
-            except ValueError:
-                print("Warning: Could not sample with probability weights. Using random sampling.")
-                return edges_df.sample(max_edges)
-        
-        return edges_df.sample(max_edges)
+        except Exception as e:
+            print(f"Warning in edge sampling: {str(e)}. Using random sampling.")
+            return edges_df.sample(max_edges)
 
     def sample_node_subgraph(self, nodes_df, edges_df, max_nodes=1000):
         """
@@ -328,68 +320,48 @@ class WazeGraphBuilder:
         Returns:
             sampled_nodes_df, sampled_edges_df
         """
-        if len(nodes_df) <= max_nodes:
+        # Check if sampling is needed
+        if max_nodes is None or len(nodes_df) <= max_nodes:
             return nodes_df, edges_df
         
         print(f"Sampling a subgraph with {max_nodes} nodes from {len(nodes_df)} total nodes...")
         
-        if 'severity' in edges_df.columns:
-            source_severity = edges_df.groupby('source')['severity'].mean().fillna(0)
-            target_severity = edges_df.groupby('target')['severity'].mean().fillna(0)
-            
-            node_importance = pd.DataFrame(index=nodes_df['node_id'])
-            node_importance['importance'] = 0
-            
-            for node_id in node_importance.index:
-                importance = 0
-                if node_id in source_severity:
-                    importance += source_severity[node_id]
-                if node_id in target_severity:
-                    importance += target_severity[node_id]
-                node_importance.loc[node_id, 'importance'] = importance
-            
-            top_nodes = node_importance.sort_values('importance', ascending=False).index[:max_nodes]
-            sampled_nodes_df = nodes_df[nodes_df['node_id'].isin(top_nodes)].copy()
-            
-        elif len(edges_df) > 0:
-            node_counts = defaultdict(int)
-            for _, edge in edges_df.iterrows():
-                node_counts[edge['source']] += 1
-                node_counts[edge['target']] += 1
-            
-            if node_counts:
-                start_node = max(node_counts.items(), key=lambda x: x[1])[0]
+        try:
+            # Method 1: Sample based on connectivity (degree centrality)
+            if len(edges_df) > 0:
+                # Count connections for each node
+                source_counts = edges_df['source'].value_counts()
+                target_counts = edges_df['target'].value_counts()
+                
+                # Combine source and target counts
+                all_counts = source_counts.add(target_counts, fill_value=0)
+                
+                # Select top nodes by connection count
+                top_nodes = all_counts.nlargest(max_nodes).index
+                
+                sampled_nodes_df = nodes_df[nodes_df['node_id'].isin(top_nodes)].copy()
             else:
-                start_node = nodes_df['node_id'].iloc[0]
+                # No edges, just randomly sample nodes
+                sampled_nodes_df = nodes_df.sample(max_nodes).copy()
             
-            visited = set([start_node])
-            queue = [start_node]
+            # Filter edges to only include those between sampled nodes
+            sampled_edges_df = edges_df[
+                edges_df['source'].isin(sampled_nodes_df['node_id']) & 
+                edges_df['target'].isin(sampled_nodes_df['node_id'])
+            ].copy()
             
-            node_connections = defaultdict(list)
-            for _, edge in edges_df.iterrows():
-                source, target = edge['source'], edge['target']
-                node_connections[source].append(target)
-                node_connections[target].append(source)  
+            print(f"Sampled subgraph has {len(sampled_nodes_df)} nodes and {len(sampled_edges_df)} edges")
+            return sampled_nodes_df, sampled_edges_df
             
-            while queue and len(visited) < max_nodes:
-                current = queue.pop(0)
-                for neighbor in node_connections[current]:
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-                        if len(visited) >= max_nodes:
-                            break
-            
-            sampled_nodes_df = nodes_df[nodes_df['node_id'].isin(visited)].copy()
-            
-        else:
+        except Exception as e:
+            print(f"Error in subgraph sampling: {str(e)}. Falling back to random sampling.")
+            # Fallback: Random node sampling
             sampled_node_ids = nodes_df['node_id'].sample(max_nodes).values
             sampled_nodes_df = nodes_df[nodes_df['node_id'].isin(sampled_node_ids)].copy()
-        
-        sampled_edges_df = edges_df[
-            edges_df['source'].isin(sampled_nodes_df['node_id']) & 
-            edges_df['target'].isin(sampled_nodes_df['node_id'])
-        ].copy()
-        
-        print(f"Sampled subgraph has {len(sampled_nodes_df)} nodes and {len(sampled_edges_df)} edges")
-        return sampled_nodes_df, sampled_edges_df
+            
+            sampled_edges_df = edges_df[
+                edges_df['source'].isin(sampled_nodes_df['node_id']) & 
+                edges_df['target'].isin(sampled_nodes_df['node_id'])
+            ].copy()
+            
+            return sampled_nodes_df, sampled_edges_df

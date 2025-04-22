@@ -6,7 +6,7 @@ data:
   - severity
   - delay
   - length
-  full_graph: false
+  full_graph: true
   interval_minutes: 15
   max_snapshots: 1000
   num_hops: 2
@@ -33,7 +33,7 @@ paths:
   output_dir: ./output
 training:
   batch_size: 32
-  device: cpu
+  device: cuda
   grad_clip_value: 5.0
   learning_rate: 0.001
   lr_scheduler: cosine
