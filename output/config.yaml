@@ -6,7 +6,7 @@ data:
   - severity
   - delay
   - length
-  full_graph: false
+  full_graph: true
   interval_minutes: 15
   max_snapshots: 1000
   num_hops: 2

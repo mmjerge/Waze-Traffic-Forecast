@@ -30,3 +30,17 @@ waze_traffic_forecast/data/__pycache__/preprocessor.cpython-312.pyc
 waze_traffic_forecast/models/__pycache__/__init__.cpython-312.pyc
 waze_traffic_forecast/models/__pycache__/layers.cpython-312.pyc
 waze_traffic_forecast/models/__pycache__/stgformer.cpython-312.pyc
+checkpoints/best_model.pt
+checkpoints/checkpoint_epoch_5.pt
+checkpoints/checkpoint_epoch_10.pt
+checkpoints/checkpoint_epoch_15.pt
+checkpoints/checkpoint_epoch_20.pt
+checkpoints/checkpoint_epoch_25.pt
+output/test_predictions.pt
+waze_traffic_forecast/__pycache__/__init__.cpython-311.pyc
+waze_traffic_forecast/__pycache__/_config.cpython-311.pyc
+waze_traffic_forecast/__pycache__/dataset.cpython-311.pyc
+waze_traffic_forecast/__pycache__/__init__.cpython-311.pyc
+waze_traffic_forecast/__pycache__/_config.cpython-311.pyc
+waze_traffic_forecast/__pycache__/dataset.cpython-311.pyc
+waze_traffic_forecast/__pycache__/__init__.cpython-311.pyc

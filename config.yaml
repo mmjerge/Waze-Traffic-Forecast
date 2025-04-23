@@ -17,7 +17,7 @@ data:
     - delay
     - length
   # Graph sampling options
-  full_graph: false  # Set to true to train on the full graph using mini-batches
+  full_graph: true  # Set to true to train on the full graph using mini-batches
   subgraph_nodes: 5000  # Maximum nodes for subgraph sampling (used when full_graph is false)
   batch_size: 1000  # Mini-batch size for full graph training
   num_hops: 2  # Number of hops for neighborhood sampling
