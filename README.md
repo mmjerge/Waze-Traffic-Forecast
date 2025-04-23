@@ -146,10 +146,6 @@ To validate the functionality of data processing and model components, run the t
 pytest
 ```
 
-## Contributing
-
-Contributions, issues, and feature requests are welcome! Feel free to open a pull request or issue on the repository.
-
 ## Citation
 
 ```
