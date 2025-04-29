@@ -61,6 +61,16 @@ To train on the full graph using mini-batch training:
 python scripts/train_model.py --config config.yaml
 ```
 
+```bash
+# Basic command with optimization
+python scripts/train_model.py --config config.yaml --optimize
+```
+
+```bash
+# Maximum performance setup
+python scripts/train_model.py --config config.yaml --optimize --mixed_precision fp16 --batch_multiplier 8 --cache_data --num_workers 16
+```
+
 ### Distributed Training
 
 For multi-GPU training:
