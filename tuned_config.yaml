@@ -1,0 +1,59 @@
+# Configuration for STGformer model on Waze traffic data
+# Tuned for faster convergence and better performance
+
+data:
+  directory: /scratch/mj6ux/data/waze  # Path to Waze data
+  full_graph: false                    # Whether to use full graph or subgraph
+  subgraph_nodes: 5000                 # Number of nodes to sample for subgraph
+  batch_size: 1000                     # Batch size for node sampling (not training batch)
+  num_hops: 2                          # Number of hops for neighborhood sampling
+  interval_minutes: 15                 # Time interval between snapshots
+  max_snapshots: 1000                  # Maximum number of snapshots to use
+  feature_columns:                     # Features to use from jam data
+    - speed
+    - severity
+    - delay
+    - length
+  prediction_horizon: 4                # Number of future steps to predict
+  sequence_length: 12                  # Number of past steps to use
+  train_ratio: 0.7                     # Ratio of data for training
+  val_ratio: 0.15                      # Ratio of data for validation
+
+model:
+  type: "stgformer"                    # Model type
+  num_layers: 2                        # Number of layers
+  num_heads: 8                         # Number of attention heads
+  hidden_channels: 64                  # Number of hidden channels (increased from default)
+  temporal_size: 12                    # Size of temporal embedding
+  spatial_size: 16                     # Size of spatial embedding
+  temporal_attention_layers: 3         # Number of temporal attention layers (increased)
+  spatial_attention_layers: 2          # Number of spatial attention layers
+  attention_heads: 8                   # Number of attention heads (kept for compatibility)
+  ffn_size: 256                        # Size of feed-forward network
+  dropout: 0.2                         # Dropout rate (added regularization)
+  use_layer_norm: true                 # Whether to use layer normalization
+  use_residual: true                   # Whether to use residual connections
+
+training:
+  device: "auto"                       # Device to use for training
+  batch_size: 64                       # Training batch size (increased from default)
+  num_epochs: 120                      # Number of epochs to train
+  learning_rate: 0.002                 # Learning rate (increased)
+  weight_decay: 0.0005                 # Fixed: explicit decimal instead of scientific notation
+  patience: 15                         # Patience for early stopping (increased)
+  lr_scheduler:                        # Learning rate scheduler
+    type: "one_cycle"                  # Use One Cycle scheduler (better than cosine)
+    pct_start: 0.3                     # Percentage of training spent increasing lr
+    div_factor: 25                     # Initial lr = max_lr/div_factor
+    final_div_factor: 1000             # Final lr = initial_lr/final_div_factor
+  optimizer:
+    type: "adam"                       # Optimizer type
+    beta1: 0.9                         # Beta1 for Adam
+    beta2: 0.999                       # Beta2 for Adam
+  loss:
+    type: "mse"                        # Loss function
+
+paths:
+  output_dir: ./output                 # Directory for outputs
+  checkpoint_dir: ./checkpoints        # Directory for checkpoints
+  log_dir: ./logs                      # Directory for logs
