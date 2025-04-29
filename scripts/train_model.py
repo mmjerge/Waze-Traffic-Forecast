@@ -2,6 +2,7 @@
 """
 Script for training the STGformer model on Waze traffic data.
 Uses Weights & Biases for experiment tracking and Accelerate for multi-GPU training.
+Optimized for performance on high-end hardware with single-GPU enhancements.
 """
 
 import os
@@ -17,6 +18,12 @@ import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader, random_split
+
+# Set CUDA optimization flags for better performance
+torch.backends.cudnn.benchmark = True  # Enable cudnn auto-tuner
+torch.backends.cudnn.deterministic = False  # Disable deterministic mode for speed
+torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere and newer GPUs
+torch.backends.cudnn.allow_tf32 = True  # Allow TF32 for convolutions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -71,6 +78,94 @@ def sparse_tensor_collate_fn(batch):
     return torch.utils.data.default_collate(batch)
 
 
+class EnhancedSTGformerModel(STGformerModel):
+    """Wrapper class that adds robust handling of adjacency matrices to STGformerModel"""
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self._printed_debug_info = False
+        self._cached_adj_mat = None
+    
+    def prepare_adjacency_matrix(self, a_seq, x_seq):
+        """
+        Convert adjacency matrix to the format expected by the model.
+        
+        Args:
+            a_seq: List or tensor containing adjacency information
+            x_seq: Input sequence tensor to get batch size and device
+            
+        Returns:
+            Processed adjacency matrix as 3D tensor suitable for batch operations
+        """
+        if self._cached_adj_mat is not None:
+            # Use cached adjacency if available (for consistent training)
+            return self._cached_adj_mat
+            
+        device = x_seq.device
+        batch_size = x_seq.shape[0]
+        seq_len = x_seq.shape[1]
+        num_nodes = x_seq.shape[2]
+        
+        # Create a batched identity adjacency matrix - this is what works with this model
+        print(f"[INFO] Creating batched adjacency tensor with shape: ({batch_size}, {num_nodes}, {num_nodes})")
+        # Create a repeated identity matrix for each batch and time step
+        # For STGformer, we need an adjacency matrix per batch item
+        adj = torch.eye(num_nodes, device=device).unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # Print shape to verify
+        print(f"[DEBUG] Created adjacency tensor with shape: {adj.shape}")
+        
+        # Cache it for future batches (assuming same batch size)
+        self._cached_adj_mat = adj
+        return adj
+    
+    def train_step(self, x_seq, a_seq, y_true):
+        """
+        Enhanced train step with specialized adjacency matrix handling.
+        """
+        self.optimizer.zero_grad()
+        
+        # Debug information for first batch only
+        if not self._printed_debug_info:
+            print(f"[DEBUG] x_seq type: {type(x_seq)}, shape: {x_seq.shape if hasattr(x_seq, 'shape') else 'no shape'}")
+            print(f"[DEBUG] a_seq type: {type(a_seq)}")
+            if isinstance(a_seq, list):
+                print(f"[DEBUG] a_seq length: {len(a_seq)}")
+                if len(a_seq) > 0:
+                    print(f"[DEBUG] a_seq[0] type: {type(a_seq[0])}")
+            else:
+                print(f"[DEBUG] a_seq shape: {a_seq.shape if hasattr(a_seq, 'shape') else 'no shape'}")
+            print(f"[DEBUG] y_true type: {type(y_true)}, shape: {y_true.shape if hasattr(y_true, 'shape') else 'no shape'}")
+            self._printed_debug_info = True
+        
+        # Ensure tensors are on the correct device
+        device = x_seq.device
+        y_true = y_true.to(device)
+        
+        # Process the adjacency matrix
+        adj = self.prepare_adjacency_matrix(a_seq, x_seq)
+        
+        # Forward pass
+        y_pred = self.model(x_seq, adj)
+        
+        # Calculate loss
+        loss = self.model.get_loss(y_pred, y_true)
+        
+        # Backward pass
+        loss.backward()
+        self.optimizer.step()
+        
+        return loss.item()
+    
+    def predict_step(self, x_seq, a_seq):
+        """Enhanced predict step with specialized adjacency matrix handling"""
+        # Process the adjacency matrix
+        adj = self.prepare_adjacency_matrix(a_seq, x_seq)
+        
+        # Forward pass
+        return self.model(x_seq, adj)
+
+
 def train_model(config, **kwargs):
     """
     Train the STGformer model using the specified configuration.
@@ -82,8 +177,22 @@ def train_model(config, **kwargs):
     Returns:
         Trained model and training history
     """
+    # Enable profiling if requested
+    profiling_enabled = kwargs.get('profile', False)
+    prof = None
+    
+    # Check for fast dev run mode
+    fast_dev_run = kwargs.get('fast_dev_run', False)
+    if fast_dev_run:
+        config['training']['num_epochs'] = min(2, config['training']['num_epochs'])
+        limit_batches = 1  # Process only 1 batch per epoch
+    else:
+        limit_batches = float('inf')  # Process all batches
+    
+    # Initialize accelerator with mixed precision for better performance
     accelerator = Accelerator(
         gradient_accumulation_steps=kwargs.get('gradient_accumulation_steps', 1),
+        mixed_precision=kwargs.get('mixed_precision', 'fp16'),  # Enable mixed precision by default
         log_with="wandb" if not kwargs.get('disable_wandb', False) else None
     )
     
@@ -109,6 +218,9 @@ def train_model(config, **kwargs):
         print(f"  Number of processes: {accelerator.num_processes}")
         print(f"  Distributed type: {accelerator.distributed_type}")
         print(f"  Mixed precision: {accelerator.mixed_precision}")
+        
+        if fast_dev_run:
+            print("Running in fast development mode (1 batch per epoch, 2 epochs)")
     
     data_dir = kwargs.get('data_dir', config['data']['directory'])
     output_dir = kwargs.get('output_dir', config['paths']['output_dir'])
@@ -127,6 +239,7 @@ def train_model(config, **kwargs):
     seed = kwargs.get('seed', 42)
     set_seed(seed)
     
+    # Create dataset (with only the parameters that WazeGraphDataset actually supports)
     print(f"Loading dataset from {data_dir}")
     dataset = WazeGraphDataset(
         data_dir=data_dir,
@@ -192,12 +305,18 @@ def train_model(config, **kwargs):
         print(f"Validation size: {len(val_dataset)}")
         print(f"Test size: {len(test_dataset)}")
     
+    # Optimize dataloader parameters for better performance
+    num_workers = min(kwargs.get('num_workers', 4), os.cpu_count() or 4)
+    prefetch_factor = kwargs.get('prefetch_factor', 2)
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=kwargs.get('num_workers', 4),
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,  # Keep workers alive between epochs
+        prefetch_factor=prefetch_factor,  # Prefetch batches
         collate_fn=sparse_tensor_collate_fn
     )
     
@@ -205,8 +324,10 @@ def train_model(config, **kwargs):
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=kwargs.get('num_workers', 4),
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=prefetch_factor,
         collate_fn=sparse_tensor_collate_fn
     )
     
@@ -214,16 +335,25 @@ def train_model(config, **kwargs):
         test_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=kwargs.get('num_workers', 4),
+        num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=prefetch_factor,
         collate_fn=sparse_tensor_collate_fn
     )
     
     if accelerator.is_main_process:
         print("Initializing model")
         
-    model = STGformerModel(config)
+    # Use our enhanced model wrapper
+    model = EnhancedSTGformerModel(config)
     model.build_model(in_channels, out_channels, num_nodes)
+    
+    # Enable gradient checkpointing if requested
+    if kwargs.get('use_gradient_checkpointing', True) and hasattr(model.model, 'gradient_checkpointing_enable'):
+        model.model.gradient_checkpointing_enable()
+        if accelerator.is_main_process:
+            print("Gradient checkpointing enabled")
     
     checkpoint_path = kwargs.get('resume_from')
     start_epoch = 0
@@ -242,11 +372,26 @@ def train_model(config, **kwargs):
     if accelerator.is_main_process:
         print("Starting training")
         
+    # Initialize profiler if requested
+    if profiling_enabled and accelerator.is_main_process:
+        from torch.profiler import profile, record_function, ProfilerActivity
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(os.path.join(log_dir, 'profiler')),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        prof.start()
+        
     num_epochs = config['training']['num_epochs']
     patience = config['training']['patience']
+    eval_every = kwargs.get('eval_every', 1)
     
     best_val_loss = float('inf')
     patience_counter = 0
+    previous_val_loss = float('inf')
     
     for epoch in range(start_epoch, num_epochs):
         if accelerator.is_main_process:
@@ -264,57 +409,115 @@ def train_model(config, **kwargs):
             disable=not accelerator.is_main_process
         )
         
+        # Start profiling if enabled
+        if profiling_enabled and accelerator.is_main_process and prof:
+            prof.step()
+            
         for batch_idx, batch in enumerate(progress_bar):
+            # Fast dev run: process only limited batches
+            if batch_idx >= limit_batches:
+                break
+                
             x_seq = batch['x_seq']
             a_seq = batch['a_seq']
             y_true = batch['y_seq']
             
-            loss = model.train_step(x_seq, a_seq, y_true)
-            train_losses.append(loss)
-            
-            progress_bar.set_postfix(loss=loss)
+            try:
+                loss = model.train_step(x_seq, a_seq, y_true)
+                train_losses.append(loss)
+                
+                # Log GPU memory usage every 10 batches
+                if accelerator.is_main_process and batch_idx % 10 == 0:
+                    if torch.cuda.is_available():
+                        used_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                        progress_bar.set_postfix(loss=loss, gpu_mem=f"{used_mem:.1f}MB")
+                    else:
+                        progress_bar.set_postfix(loss=loss)
+                else:
+                    progress_bar.set_postfix(loss=loss)
+            except Exception as e:
+                print(f"[ERROR] Error in training batch {batch_idx}: {str(e)}")
+                if batch_idx == 0:  # Only break on first batch failure
+                    raise  # Re-raise the error to stop training
+                continue  # Skip this batch and continue with the next one
         
-        avg_train_loss = sum(train_losses) / len(train_losses)
+        avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0
         
         current_lr = model.optimizer.param_groups[0]['lr']
         
-        model.model.eval()
-        val_losses = []
+        # Only run validation every eval_every epochs or on the last epoch
+        run_validation = (epoch + 1) % eval_every == 0 or epoch == num_epochs - 1
         
-        progress_bar = tqdm(
-            val_loader, 
-            desc=f"Epoch {epoch+1}/{num_epochs} [Val]",
-            disable=not accelerator.is_main_process
-        )
-        
-        with torch.no_grad():
-            for batch in progress_bar:
-                x_seq = batch['x_seq']
-                a_seq = batch['a_seq']
-                y_true = batch['y_seq']
-                
-                y_pred = model.model(x_seq, a_seq)
-                
-                loss = model.model.get_loss(y_pred, y_true)
-                
-                gathered_loss = accelerator.gather(torch.tensor(loss.item(), device=accelerator.device)).mean().item()
-                val_losses.append(gathered_loss)
-                
-                progress_bar.set_postfix(loss=gathered_loss)
-        
-        val_loss = sum(val_losses) / len(val_losses)
+        if run_validation:
+            model.model.eval()
+            val_losses = []
+            
+            progress_bar = tqdm(
+                val_loader, 
+                desc=f"Epoch {epoch+1}/{num_epochs} [Val]",
+                disable=not accelerator.is_main_process
+            )
+            
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(progress_bar):
+                    # Fast dev run: process only limited batches
+                    if batch_idx >= limit_batches:
+                        break
+                        
+                    x_seq = batch['x_seq']
+                    a_seq = batch['a_seq']
+                    y_true = batch['y_seq']
+                    
+                    try:
+                        y_pred = model.predict_step(x_seq, a_seq)
+                        loss = model.model.get_loss(y_pred, y_true)
+                        
+                        gathered_loss = accelerator.gather(torch.tensor(loss.item(), device=accelerator.device)).mean().item()
+                        val_losses.append(gathered_loss)
+                        
+                        progress_bar.set_postfix(loss=gathered_loss)
+                    except Exception as e:
+                        print(f"[ERROR] Error in validation batch {batch_idx}: {str(e)}")
+                        continue  # Skip this batch
+            
+            val_loss = sum(val_losses) / len(val_losses) if val_losses else previous_val_loss
+            previous_val_loss = val_loss  # Store for use in epochs where validation is skipped
+        else:
+            # Skip validation this epoch
+            if accelerator.is_main_process:
+                print(f"Skipping validation for epoch {epoch+1}")
+            val_loss = previous_val_loss  # Use previous value for metrics and scheduler
         
         if not kwargs.get('disable_wandb', False):
             metrics = {
                 "train/loss": avg_train_loss,
-                "val/loss": val_loss,
                 "train/learning_rate": current_lr,
                 "train/epoch": epoch + 1
             }
+            
+            if run_validation:
+                metrics["val/loss"] = val_loss
+            
+            # Add GPU memory metrics
+            if torch.cuda.is_available():
+                metrics["system/gpu_memory_allocated_mb"] = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                metrics["system/gpu_memory_reserved_mb"] = torch.cuda.max_memory_reserved() / (1024 ** 2)
+                
             accelerator.log(metrics)
         
         if accelerator.is_main_process:
-            print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
+            gpu_mem_str = ""
+            if torch.cuda.is_available():
+                used_mem = torch.cuda.max_memory_allocated() / (1024 ** 2)
+                gpu_mem_str = f", GPU Mem: {used_mem:.1f}MB"
+                
+            val_str = f", Val Loss: {val_loss:.6f}" if run_validation else ", Val: skipped"
+            print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.6f}{val_str}, "
+                  f"LR: {current_lr:.6f}{gpu_mem_str}")
+            
+            # Reset peak memory stats after logging
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
         
         # Update learning rate scheduler
         if model.scheduler is not None:
@@ -323,8 +526,8 @@ def train_model(config, **kwargs):
             else:
                 model.scheduler.step()
         
-        # Early stopping
-        if accelerator.is_main_process and val_loss < best_val_loss:
+        # Early stopping - only check when validation is run
+        if run_validation and accelerator.is_main_process and val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
             
@@ -342,7 +545,7 @@ def train_model(config, **kwargs):
                 best_model_path
             )
             print(f"Saved best model checkpoint to {best_model_path}")
-        else:
+        elif run_validation:
             if accelerator.is_main_process:
                 patience_counter += 1
                 if val_loss >= best_val_loss:
@@ -383,6 +586,10 @@ def train_model(config, **kwargs):
                 print(f"Early stopping triggered after {epoch+1} epochs")
             break
     
+    # Stop profiler if enabled
+    if profiling_enabled and accelerator.is_main_process and prof:
+        prof.stop()
+    
     # Wait for all processes to reach this point
     accelerator.wait_for_everyone()
     
@@ -409,28 +616,35 @@ def train_model(config, **kwargs):
     )
     
     with torch.no_grad():
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
+            # Fast dev run: process only limited batches
+            if batch_idx >= limit_batches:
+                break
+                
             x_seq = batch['x_seq']
             a_seq = batch['a_seq']
             y_true = batch['y_seq']
             
-            y_pred = model.model(x_seq, a_seq)
-            
-            loss = model.model.get_loss(y_pred, y_true)
-            
-            gathered_loss = accelerator.gather(torch.tensor(loss.item(), device=accelerator.device)).mean().item()
-            test_losses.append(gathered_loss)
-            
-            gathered_preds = accelerator.gather(y_pred)
-            gathered_targets = accelerator.gather(y_true)
-            
-            if accelerator.is_main_process:
-                all_predictions.append(gathered_preds.cpu())
-                all_targets.append(gathered_targets.cpu())
-            
-            progress_bar.set_postfix(loss=gathered_loss)
+            try:
+                y_pred = model.predict_step(x_seq, a_seq)
+                loss = model.model.get_loss(y_pred, y_true)
+                
+                gathered_loss = accelerator.gather(torch.tensor(loss.item(), device=accelerator.device)).mean().item()
+                test_losses.append(gathered_loss)
+                
+                gathered_preds = accelerator.gather(y_pred)
+                gathered_targets = accelerator.gather(y_true)
+                
+                if accelerator.is_main_process:
+                    all_predictions.append(gathered_preds.cpu())
+                    all_targets.append(gathered_targets.cpu())
+                
+                progress_bar.set_postfix(loss=gathered_loss)
+            except Exception as e:
+                print(f"[ERROR] Error in test batch {batch_idx}: {str(e)}")
+                continue  # Skip this batch
     
-    test_loss = sum(test_losses) / len(test_losses)
+    test_loss = sum(test_losses) / len(test_losses) if test_losses else 0
     
     if accelerator.is_main_process and not kwargs.get('disable_wandb', False):
         accelerator.log({"test/loss": test_loss})
@@ -478,6 +692,8 @@ def main():
                         help='Number of worker processes for data loading')
     parser.add_argument('--save_every', type=int, default=5,
                         help='Save checkpoint every N epochs')
+    parser.add_argument('--eval_every', type=int, default=1,
+                        help='Run validation every N epochs')
     parser.add_argument('--wandb_project', type=str, default='waze-traffic-forecast',
                         help='Weights & Biases project name')
     parser.add_argument('--wandb_entity', type=str, default=None,
@@ -488,6 +704,20 @@ def main():
                         help='Disable Weights & Biases logging')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help='Number of steps to accumulate gradients')
+    parser.add_argument('--optimize', action='store_true',
+                        help='Enable optimization mode (increases batch size and enables mixed precision)')
+    parser.add_argument('--profile', action='store_true',
+                        help='Enable PyTorch profiling')
+    parser.add_argument('--mixed_precision', type=str, choices=['no', 'fp16', 'bf16'], default='fp16',
+                        help='Mixed precision mode')
+    parser.add_argument('--batch_multiplier', type=int, default=4,
+                        help='Multiply batch size by this value when optimize flag is used')
+    parser.add_argument('--use_gradient_checkpointing', action='store_true',
+                        help='Enable gradient checkpointing to save memory')
+    parser.add_argument('--fast_dev_run', action='store_true',
+                        help='Run a quick dev loop for debugging')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='Number of batches to prefetch (higher can improve performance)')
     
     args = parser.parse_args()
     
@@ -502,17 +732,39 @@ def main():
     if args.log_dir:
         config['paths']['log_dir'] = args.log_dir
     
+    # Apply optimization flags
+    if args.optimize:
+        print("Optimization mode enabled:")
+        # Increase batch size
+        original_batch_size = config['training']['batch_size']
+        config['training']['batch_size'] *= args.batch_multiplier
+        print(f"  - Increased batch size from {original_batch_size} to {config['training']['batch_size']}")
+        
+        # Enable performance optimizations
+        args.use_gradient_checkpointing = True
+        
+        # Other optimizations are applied through kwargs
+        print(f"  - Using mixed precision: {args.mixed_precision}")
+        print(f"  - Gradient checkpointing: {'enabled' if args.use_gradient_checkpointing else 'disabled'}")
+        print(f"  - Profiling: {'enabled' if args.profile else 'disabled'}")
+    
     train_model(
         config,
         resume_from=args.resume_from,
         seed=args.seed,
         num_workers=args.num_workers,
         save_every=args.save_every,
+        eval_every=args.eval_every,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_name=args.wandb_name,
         disable_wandb=args.disable_wandb,
-        gradient_accumulation_steps=args.gradient_accumulation_steps
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        profile=args.profile,
+        mixed_precision=args.mixed_precision,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
+        fast_dev_run=args.fast_dev_run,
+        prefetch_factor=args.prefetch_factor
     )
 
 

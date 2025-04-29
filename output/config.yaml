@@ -32,7 +32,7 @@ paths:
   log_dir: ./logs
   output_dir: ./output
 training:
-  batch_size: 32
+  batch_size: 128
   device: cuda
   grad_clip_value: 5.0
   learning_rate: 0.001
