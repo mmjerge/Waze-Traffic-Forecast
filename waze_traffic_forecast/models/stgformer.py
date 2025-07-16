@@ -75,7 +75,7 @@ class STGformerLayer(nn.Module):
         
     def forward(self, x, adj_list):
         """
-        Forward pass through the STGformer layer.
+        Forward pass through the STGformer layer with accident-aware processing.
         
         Args:
             x: Input tensor [batch_size, seq_len, num_nodes, hidden_dim]
@@ -89,6 +89,21 @@ class STGformerLayer(nn.Module):
         """
         batch_size, seq_len, num_nodes, hidden_dim = x.size()
         residual = x
+        
+        # Apply accident-aware attention if input has accident features
+        # Assume last 2 features are accident-related if hidden_dim >= 6
+        if hidden_dim >= 6:
+            # Extract accident information from input features
+            accident_flag = x[:, :, :, -2]      # is_accident_related
+            time_since = x[:, :, :, -1]         # time_since_accident
+            
+            # Create accident attention mask
+            # Recent accidents get higher attention weight
+            accident_attention = accident_flag * torch.exp(-time_since / 60.0)
+            accident_attention = accident_attention.unsqueeze(-1)
+            
+            # Apply accident-aware weighting
+            x = x * (1.0 + 0.3 * accident_attention)  # Boost accident areas by 30%
         
         # Apply graph propagation separately for each time step
         prop_out = []
@@ -261,6 +276,28 @@ class STGformer(nn.Module):
             loss = F.mse_loss(pred, target)
         
         return loss
+    
+    def get_accident_aware_loss(self, pred, target, accident_mask=None):
+        """
+        Calculate loss with higher weight on accident-affected areas.
+        
+        Args:
+            pred: Predictions [batch_size, pred_horizon, num_nodes, features]
+            target: Ground truth [batch_size, pred_horizon, num_nodes, features]
+            accident_mask: Binary mask for accident-affected nodes
+            
+        Returns:
+            Weighted loss value
+        """
+        base_loss = F.mse_loss(pred, target, reduction='none')
+        
+        if accident_mask is not None:
+            # Apply higher weight to accident-affected areas
+            weights = 1.0 + 2.0 * accident_mask.unsqueeze(-1)  # 3x weight for accident areas
+            weighted_loss = base_loss * weights
+            return weighted_loss.mean()
+        
+        return base_loss.mean()
 
 
 class STGformerModel:

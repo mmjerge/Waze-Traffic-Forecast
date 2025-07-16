@@ -1,0 +1,25 @@
+name: waze-traffic
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - jupyter
+  - tqdm
+  - pyyaml
+  - pip:
+      - torch
+      - torchvision
+      - torchaudio
+      - accelerate
+      - transformers
+      - datasets
+      - wandb
+      - pyarrow
+      - einops
+      - -e .

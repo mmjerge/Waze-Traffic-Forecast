@@ -2,10 +2,10 @@
 
 # Data settings
 data:
-  directory: /scratch/mj6ux/data/waze
-  sample_size: null  # Set to a number for development/testing
+  directory: /Users/charlottejackson/waze_forecast_data
+  sample_size: 10000  # Set to a number for development/testing
   interval_minutes: 15
-  max_snapshots: 1000
+  max_snapshots: 100  # Reduced for local testing
   train_ratio: 0.7
   val_ratio: 0.15
   test_ratio: 0.15
@@ -16,10 +16,18 @@ data:
     - severity
     - delay
     - length
+    - is_accident_related      # NEW: Boolean flag (0/1)
+    - time_since_accident      # NEW: Minutes since accident was reported
+  
+  # NEW: Accident processing parameters
+  accident_processing:
+    max_accident_duration: 180    # Consider accident active for 3 hours max
+    time_decay_factor: 0.95      # Exponential decay of accident influence
+    enable_accident_features: true
   # Graph sampling options
-  full_graph: true  # Set to true to train on the full graph using mini-batches
-  subgraph_nodes: 5000  # Maximum nodes for subgraph sampling (used when full_graph is false)
-  batch_size: 1000  # Mini-batch size for full graph training
+  full_graph: false  # Set to false for sparse subgraph training (better for local testing)
+  subgraph_nodes: 1000  # Maximum nodes for subgraph sampling (reduced for local testing)
+  batch_size: 100  # Mini-batch size for full graph training
   num_hops: 2  # Number of hops for neighborhood sampling
 
 # Model settings
@@ -36,11 +44,11 @@ model:
 
 # Training settings
 training:
-  batch_size: 32
+  batch_size: 16  # Reduced for local testing
   learning_rate: 1.0e-3
   weight_decay: 1.0e-4
-  num_epochs: 100
-  patience: 10  # Early stopping patience
+  num_epochs: 10  # Reduced for local testing
+  patience: 5  # Early stopping patience
   lr_scheduler: cosine  # Options: step, cosine, plateau
   lr_scheduler_params:
     step_size: 10

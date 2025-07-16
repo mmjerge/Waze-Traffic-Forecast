@@ -7,6 +7,9 @@ Optimized for performance on high-end hardware with single-GPU enhancements.
 
 import os
 import sys
+
+# Fix OpenMP library conflict on macOS
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import argparse
 import yaml
 import torch
@@ -190,9 +193,20 @@ def train_model(config, **kwargs):
         limit_batches = float('inf')  # Process all batches
     
     # Initialize accelerator with mixed precision for better performance
+    # Use appropriate mixed precision based on platform
+    mixed_precision = kwargs.get('mixed_precision', None)
+    if mixed_precision is None:
+        # Auto-detect appropriate mixed precision
+        if torch.cuda.is_available():
+            mixed_precision = 'fp16'  # Use fp16 on CUDA
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            mixed_precision = 'no'  # MPS doesn't support fp16 mixed precision
+        else:
+            mixed_precision = 'no'  # Default to no mixed precision for CPU
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=kwargs.get('gradient_accumulation_steps', 1),
-        mixed_precision=kwargs.get('mixed_precision', 'fp16'),  # Enable mixed precision by default
+        mixed_precision=mixed_precision,
         log_with="wandb" if not kwargs.get('disable_wandb', False) else None
     )
     
@@ -708,8 +722,8 @@ def main():
                         help='Enable optimization mode (increases batch size and enables mixed precision)')
     parser.add_argument('--profile', action='store_true',
                         help='Enable PyTorch profiling')
-    parser.add_argument('--mixed_precision', type=str, choices=['no', 'fp16', 'bf16'], default='fp16',
-                        help='Mixed precision mode')
+    parser.add_argument('--mixed_precision', type=str, choices=['no', 'fp16', 'bf16'], default=None,
+                        help='Mixed precision mode (auto-detected if not specified)')
     parser.add_argument('--batch_multiplier', type=int, default=4,
                         help='Multiply batch size by this value when optimize flag is used')
     parser.add_argument('--use_gradient_checkpointing', action='store_true',
@@ -766,6 +780,79 @@ def main():
         fast_dev_run=args.fast_dev_run,
         prefetch_factor=args.prefetch_factor
     )
+
+
+def evaluate_with_accident_metrics(model, dataloader, device, accelerator):
+    """
+    Enhanced evaluation with accident-specific metrics.
+    
+    Args:
+        model: The trained model
+        dataloader: DataLoader with evaluation data
+        device: Device to run evaluation on
+        accelerator: Accelerator for distributed evaluation
+        
+    Returns:
+        Dictionary with accident-specific metrics
+    """
+    model.eval()
+    total_loss = 0
+    accident_loss = 0
+    normal_loss = 0
+    accident_samples = 0
+    normal_samples = 0
+    batch_count = 0
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            x_seq = batch['x_seq']
+            y_true = batch['y_seq']
+            a_seq = batch['a_seq']
+            
+            # Extract accident information from the last timestep
+            # Assume accident features are the last 2 features if they exist
+            if x_seq.shape[-1] >= 6:  # Original 4 + 2 accident features
+                accident_mask = x_seq[:, -1, :, -2] > 0  # is_accident_related from last timestep
+                
+                y_pred = model.predict_step(x_seq, a_seq)
+                
+                # Calculate separate losses for accident and normal traffic
+                if accident_mask.any():
+                    accident_indices = accident_mask.nonzero(as_tuple=False)
+                    if len(accident_indices) > 0:
+                        acc_pred = y_pred[accident_indices[:, 0], :, accident_indices[:, 1]]
+                        acc_true = y_true[accident_indices[:, 0], :, accident_indices[:, 1]]
+                        acc_loss = torch.nn.functional.mse_loss(acc_pred, acc_true)
+                        accident_loss += acc_loss.item()
+                        accident_samples += len(accident_indices)
+                
+                if (~accident_mask).any():
+                    normal_indices = (~accident_mask).nonzero(as_tuple=False)
+                    if len(normal_indices) > 0:
+                        norm_pred = y_pred[normal_indices[:, 0], :, normal_indices[:, 1]]
+                        norm_true = y_true[normal_indices[:, 0], :, normal_indices[:, 1]]
+                        norm_loss = torch.nn.functional.mse_loss(norm_pred, norm_true)
+                        normal_loss += norm_loss.item()
+                        normal_samples += len(normal_indices)
+                
+                # Calculate total loss
+                total_loss += torch.nn.functional.mse_loss(y_pred, y_true).item()
+                batch_count += 1
+    
+    # Calculate averages
+    avg_total_loss = total_loss / max(1, batch_count)
+    avg_accident_loss = accident_loss / max(1, accident_samples)
+    avg_normal_loss = normal_loss / max(1, normal_samples)
+    accident_ratio = accident_samples / max(1, accident_samples + normal_samples)
+    
+    return {
+        'total_loss': avg_total_loss,
+        'accident_mse': avg_accident_loss,
+        'normal_mse': avg_normal_loss,
+        'accident_ratio': accident_ratio,
+        'accident_samples': accident_samples,
+        'normal_samples': normal_samples
+    }
 
 
 if __name__ == "__main__":

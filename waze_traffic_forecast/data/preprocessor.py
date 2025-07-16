@@ -23,9 +23,9 @@ class WazePreprocessor:
         """Get paths to all relevant data files (parquet or csv)."""
         # Define file name templates without extensions
         base_names = {
-            'jam_segments': 'waze-jam-segments000',
-            'jam_line': 'waze-jam-line000',
-            'jams': ['waze-jams00{}'.format(i) for i in range(4)],
+            'jam_segments': 'waze-jam-segments000-subset000',
+            'jam_line': 'waze-jam-line000-subset000',
+            'jams': ['waze-jams000-subset000'],  # Updated for your single file
             'alerts': 'waze-alerts000'
         }
         
@@ -143,6 +143,13 @@ class WazePreprocessor:
             for col in ['severity', 'speed', 'length', 'delay']:
                 if col in jams_df.columns:
                     jams_df[col] = jams_df[col].fillna(0)
+            
+            # NEW: Clean accident-related columns
+            if 'is_accident_related' in jams_df.columns:
+                jams_df['is_accident_related'] = jams_df['is_accident_related'].fillna(0).astype(int)
+            if 'time_since_accident' in jams_df.columns:
+                jams_df['time_since_accident'] = jams_df['time_since_accident'].fillna(0).clip(lower=0)
+            
             cleaned_data['jams_df'] = jams_df
             
         if 'alerts_df' in data:

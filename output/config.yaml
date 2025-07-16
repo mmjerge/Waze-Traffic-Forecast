@@ -1,19 +1,25 @@
 data:
-  batch_size: 1000
-  directory: /scratch/mj6ux/data/waze
+  accident_processing:
+    enable_accident_features: true
+    max_accident_duration: 180
+    time_decay_factor: 0.95
+  batch_size: 100
+  directory: /Users/charlottejackson/waze_forecast_data
   feature_columns:
   - speed
   - severity
   - delay
   - length
-  full_graph: true
+  - is_accident_related
+  - time_since_accident
+  full_graph: false
   interval_minutes: 15
-  max_snapshots: 1000
+  max_snapshots: 100
   num_hops: 2
   prediction_horizon: 3
-  sample_size: null
+  sample_size: 10000
   sequence_length: 12
-  subgraph_nodes: 5000
+  subgraph_nodes: 1000
   test_ratio: 0.15
   train_ratio: 0.7
   val_ratio: 0.15
@@ -32,8 +38,8 @@ paths:
   log_dir: ./logs
   output_dir: ./output
 training:
-  batch_size: 128
-  device: cuda
+  batch_size: 16
+  device: mps
   grad_clip_value: 5.0
   learning_rate: 0.001
   lr_scheduler: cosine
@@ -42,6 +48,6 @@ training:
     gamma: 0.1
     patience: 5
     step_size: 10
-  num_epochs: 100
-  patience: 10
+  num_epochs: 10
+  patience: 5
   weight_decay: 0.0001

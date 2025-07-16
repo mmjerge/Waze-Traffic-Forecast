@@ -48,8 +48,8 @@ class WazeGraphBuilder:
         
         # Join with jams data if available
         if jams_df is not None and len(jams_df) > 0:
-            # Select key traffic attributes
-            jam_attrs = ['id', 'severity', 'speed', 'length', 'delay', 'level']
+            # Select key traffic attributes including accident data
+            jam_attrs = ['id', 'severity', 'speed', 'length', 'delay', 'level', 'accident_uuid', 'accident_timestamp']
             existing_attrs = [col for col in jam_attrs if col in jams_df.columns]
             
             if 'id' in existing_attrs and len(existing_attrs) > 1:
@@ -57,6 +57,32 @@ class WazeGraphBuilder:
                 if 'jamid' not in jams_df.columns and 'id' in jams_df.columns:
                     jams_merge = jams_df[existing_attrs].copy()
                     jams_merge.rename(columns={'id': 'jamid'}, inplace=True)
+                    
+                    # NEW: Process binary accident data
+                    if 'accident_uuid' in jams_merge.columns:
+                        jams_merge['is_accident_related'] = jams_merge['accident_uuid'].notna().astype(int)
+                        
+                        # Calculate time since accident report
+                        if 'accident_timestamp' in jams_merge.columns:
+                            # Convert timestamps to datetime if needed
+                            accident_time = pd.to_datetime(jams_merge['accident_timestamp'])
+                            scrape_time = pd.to_datetime(edges_df['scrapedatetime'])
+                            
+                            # Calculate minutes since accident
+                            time_diff = (scrape_time - accident_time).dt.total_seconds() / 60
+                            jams_merge['time_since_accident'] = time_diff.fillna(0).clip(lower=0)
+                            
+                            # Set accident flag to 0 if too much time has passed (3 hours max)
+                            max_duration = 180  # 3 hours
+                            expired_mask = jams_merge['time_since_accident'] > max_duration
+                            jams_merge.loc[expired_mask, 'is_accident_related'] = 0
+                            jams_merge.loc[expired_mask, 'time_since_accident'] = 0
+                        else:
+                            jams_merge['time_since_accident'] = 0
+                    else:
+                        # Default values if no accident data
+                        jams_merge['is_accident_related'] = 0
+                        jams_merge['time_since_accident'] = 0
                     
                     # Merge with edges
                     edges_df = edges_df.merge(
@@ -180,9 +206,10 @@ class WazeGraphBuilder:
         
         # Default feature columns if not specified
         if feature_cols is None:
-            # Try common traffic features
+            # Try common traffic features including accident data
             feature_cols = []
-            for col in ['speed', 'severity', 'level', 'delay', 'length']:
+            for col in ['speed', 'severity', 'level', 'delay', 'length', 
+                        'is_accident_related', 'time_since_accident']:
                 if col in snapshots[0]['edges'].columns:
                     feature_cols.append(col)
             
@@ -279,6 +306,40 @@ class WazeGraphBuilder:
         
         print(f"Created feature tensor with shape {X_tensor.shape} and {len(sparse_adjacency_list)} adjacency matrices")
         return X_tensor, sparse_adjacency_list
+
+    def enhance_accident_features(self, edges_df):
+        """
+        Engineer additional accident-related features from binary data.
+        
+        Args:
+            edges_df: DataFrame with basic accident features
+            
+        Returns:
+            Enhanced DataFrame with derived accident features
+        """
+        enhanced_df = edges_df.copy()
+        
+        if 'is_accident_related' in enhanced_df.columns and 'time_since_accident' in enhanced_df.columns:
+            # Create accident intensity based on recency
+            # More recent accidents have higher intensity
+            enhanced_df['accident_intensity'] = (
+                enhanced_df['is_accident_related'] * 
+                np.exp(-enhanced_df['time_since_accident'] / 60)  # Exponential decay over hours
+            )
+            
+            # Create accident phase indicators
+            enhanced_df['accident_fresh'] = (
+                (enhanced_df['is_accident_related'] == 1) & 
+                (enhanced_df['time_since_accident'] <= 30)
+            ).astype(int)
+            
+            enhanced_df['accident_lingering'] = (
+                (enhanced_df['is_accident_related'] == 1) & 
+                (enhanced_df['time_since_accident'] > 30) & 
+                (enhanced_df['time_since_accident'] <= 120)
+            ).astype(int)
+        
+        return enhanced_df
 
     def sample_important_edges(self, edges_df, max_edges=100000):
         """

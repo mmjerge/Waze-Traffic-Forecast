@@ -80,7 +80,12 @@ def load_config(config_path: str) -> Dict[str, Any]:
         config = yaml.safe_load(f)
     
     if config["training"]["device"] == "auto":
-        config["training"]["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            config["training"]["device"] = "cuda"
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            config["training"]["device"] = "mps"
+        else:
+            config["training"]["device"] = "cpu"
     
     return config
 

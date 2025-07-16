@@ -104,33 +104,41 @@ class WazeGraphDataset(Dataset):
         try:
             print(f"Looking for data files in {self.data_dir}")
             # Check for both parquet and CSV files
-            segments_parquet = os.path.join(self.data_dir, 'waze-jam-segments000.parquet')
-            segments_csv = os.path.join(self.data_dir, 'waze-jam-segments000.csv')
-            jams_parquet = os.path.join(self.data_dir, 'waze-jams000.parquet')
-            jams_csv = os.path.join(self.data_dir, 'waze-jams000.csv')
+            segments_parquet = os.path.join(self.data_dir, 'waze-jam-segments000-subset000.parquet')
+            segments_csv = os.path.join(self.data_dir, 'waze-jam-segments000-subset000.csv')
+            jams_parquet = os.path.join(self.data_dir, 'waze-jams000-subset000.parquet')
+            jams_csv = os.path.join(self.data_dir, 'waze-jams000-subset000.csv')
             
             # Determine which files to use based on availability and preference
-            use_csv_segments = self.use_csv or (not os.path.exists(segments_parquet) and os.path.exists(segments_csv))
-            use_csv_jams = self.use_csv or (not os.path.exists(jams_parquet) and os.path.exists(jams_csv))
-            
-            segments_file = segments_csv if use_csv_segments else segments_parquet
-            jams_file = jams_csv if use_csv_jams else jams_parquet
+            if os.path.exists(segments_parquet) and not self.use_csv:
+                segments_file = segments_parquet
+            elif os.path.exists(segments_csv):
+                segments_file = segments_csv
+            else:
+                segments_file = segments_csv  # Default fallback
+                
+            if os.path.exists(jams_parquet) and not self.use_csv:
+                jams_file = jams_parquet
+            elif os.path.exists(jams_csv):
+                jams_file = jams_csv
+            else:
+                jams_file = jams_csv  # Default fallback
             
             if os.path.exists(segments_file) and os.path.exists(jams_file):
                 # Load data with progress indicators
-                if segments_file.endswith('.csv'):
-                    print(f"Reading segments from CSV: {segments_file}")
-                    segments_df = pd.read_csv(segments_file, low_memory=False)
-                else:
+                if segments_file.endswith('.parquet'):
                     print(f"Reading segments from parquet: {segments_file}")
                     segments_df = pd.read_parquet(segments_file)
-                
-                if jams_file.endswith('.csv'):
-                    print(f"Reading jams from CSV: {jams_file}")
-                    jams_df = pd.read_csv(jams_file, low_memory=False)
                 else:
+                    print(f"Reading segments from CSV: {segments_file}")
+                    segments_df = pd.read_csv(segments_file, low_memory=False)
+                
+                if jams_file.endswith('.parquet'):
                     print(f"Reading jams from parquet: {jams_file}")
                     jams_df = pd.read_parquet(jams_file)
+                else:
+                    print(f"Reading jams from CSV: {jams_file}")
+                    jams_df = pd.read_csv(jams_file, low_memory=False)
                 
                 print(f"Loaded {len(segments_df)} segment records and {len(jams_df)} jam records")
                 
@@ -171,7 +179,8 @@ class WazeGraphDataset(Dataset):
                 # Prepare feature columns
                 if self.feature_cols is None:
                     self.feature_cols = []
-                    for col in ['speed', 'severity', 'delay', 'length']:
+                    for col in ['speed', 'severity', 'delay', 'length', 
+                                'is_accident_related', 'time_since_accident']:
                         if col in edges_df.columns:
                             self.feature_cols.append(col)
                 
